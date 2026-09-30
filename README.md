@@ -71,6 +71,38 @@ GPU), MTP 2 tokens with Gumbel-coupled drafts and prompt lookup, vision on with 
 ~7 GB of RAM, which long agent sessions exhausted (the box thrashed until it froze, before the heap fix below and
 with only 8 GB of swap). Quality is close (next section), and 3.05 is ~25% faster.
 
+### Long context: 262K and 512K (YaRN)
+
+The model was trained on 262,144 positions. Past that, YaRN rope scaling rescales the rotary angles; exllamav3 reads
+it from the model's `config.json`, and the QSA indexer uses the same rope object as the attention, so its selection
+is scaled too. A model directory for 512K is the original one (weights hard-linked) with only `config.json` changed:
+
+```json
+"max_position_embeddings": 524288,
+"rope_parameters": { ..., "rope_type": "yarn", "factor": 2.0, "original_max_position_embeddings": 262144 }
+```
+
+The KV cache lives in VRAM (~13.7 KB per token at Q8, including the indexer keys), so every extra context token
+moves expert weights to the CPU. Measured with `rocm_tests/long_ctx_api.py`: a haystack of real text (wikitext plus
+source files) with three facts at 15%, 50% and 85% depth, asked for together, then a ~250-word answer on the same
+cached prefix; 3.05 bpw heretic build, 8192-token prefill chunks, MTP with prompt lookup, TabbyAPI:
+
+| | 192K (default) | 262K (trained maximum) | 512K (YaRN x2) |
+|---|---|---|---|
+| CPU experts per layer (`cpu_moe_split_experts`) | 380 | 392 | 444 (438 ran out of VRAM during the long prefill) |
+| VRAM / RAM available after load | 25.0 GB / ~21 GB | 24.3 GB / 19.6 GB | 24.5 GB / 15.4 GB |
+| decode, short code edit | 80-84 tok/s | 78 tok/s | 65 tok/s |
+| needle test | | **3/3** at 195,736 tokens | **3/3** at 398,902 tokens |
+| prefill of that prompt | | 150 s (1,300 tok/s) | 320 s (1,245 tok/s) |
+| decode at that context | | 41-45 tok/s | 34-46 tok/s |
+| MMLU-Pro, first 30 questions | 25/30 | (same model) | 25/30 |
+
+YaRN changes the angles at every position, so a scaled run is a slightly different model even on short prompts
+(the MMLU-Pro sample shows no loss); enable it only when you need more than 262K. **1M tokens does not fit this way**
+on 24 GB: its KV cache alone is ~14.4 GB of VRAM, which would push every expert to the CPU (46.7 GB of pinned RAM at
+3.05 bpw, more than a 64 GB machine can spare). Engines that do run 1M on 24 GB + 64 GB (Strata, 2-bit experts) keep
+the KV cache in RAM and only the part the attention reads in VRAM; that is not implemented here.
+
 ### Capability: Flash-Next 3.05 bpw vs the dense 27B
 
 Same harness for both (`rocm_tests/iqbench.py`, through the TabbyAPI endpoint, thinking on, temperature 0.6 /
@@ -527,6 +559,7 @@ verification from ~45 ms to ~14 ms per round.
 | `vram.py <ctx> <kv_bits> <draft_kv_bits>` | VRAM per component |
 | `gen_check.py -m <model> [--mtp] [--task edit] [--temp T]`, `gen_check_mt.py` | generation fidelity at long context: generated tokens vs the argmax of a chunked-prefill reference, per window (flat ~0.975 greedy when healthy); `_mt`: multi-turn with recurrent-state restore |
 | `speed_ab.py -m <model> [--task edit] [--seeds 1,2,3]` | paired decode-speed A/B of Gumbel coupling and prompt lookup in one process |
+| `long_ctx_api.py --tokens N [--url U]` | long-context check through the API: three needles at 15/50/85% depth in real text, then a ~250-word answer on the cached prefix |
 | `kprof_prefill.py -m <model> [--chunk N]` | kernel and aten-op profile (with shapes) of one prefill chunk |
 | `prefill_bench.py -m <model> [--chunk N] [--mtp] [--warm]` | prefill tok/s through the Generator on fresh prompts, with n-gram prefetch hit counts |
 | `dist_check.py -m <model>` | token-distribution check of coupled vs uncoupled speculative sampling |
