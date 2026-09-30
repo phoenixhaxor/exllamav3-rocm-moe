@@ -1,4 +1,5 @@
 #include "moe_mul1.h"
+#include "moe_idle.h"
 #include <c10/util/Half.h>
 #include <torch/extension.h>
 
@@ -1749,9 +1750,9 @@ struct Pool
             if (g == seen)
             {
                 // Matches the outer job-ring poll's threshold (moe_handoff.cu)
-                if (++idle < 65536) { cpu_pause(); continue; }
+                if (moe_idle_should_spin(idle)) { cpu_pause(); continue; }
 #ifdef __linux__
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                std::this_thread::sleep_for(std::chrono::microseconds(moe_idle_sleep_us(idle)));
 #else
                 // Never a timed nap here: Windows rounds short sleeps up to the timer quantum
                 // (default 15.6 ms), and the run() barrier turns one late waker into everyone

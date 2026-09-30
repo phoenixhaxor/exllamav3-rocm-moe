@@ -1,5 +1,6 @@
 #include "moe_handoff.h"
 #include "moe_mul1.h"
+#include "moe_idle.h"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -278,8 +279,8 @@ void exl3_moe_cpu_worker_run
             if (wake != s_last_wake) { s_last_wake = wake; s_idle = 0; }
             if (load_acquire_u32(stage_tail) == shead)
             {
-                if (++s_idle < 65536) { cpu_pause_(); continue; }
-                std::this_thread::sleep_for(std::chrono::microseconds(50));
+                if (moe_idle_should_spin(s_idle)) { cpu_pause_(); continue; }
+                std::this_thread::sleep_for(std::chrono::microseconds(moe_idle_sleep_us(s_idle)));
                 continue;
             }
             s_idle = 0;
@@ -336,8 +337,8 @@ void exl3_moe_cpu_worker_run
         {
             // Spin hard in-pass (jobs arrive within microseconds of the GPU reaching the layer),
             // back off to naps when the queue has been dry for a while
-            if (++idle < 65536) { cpu_pause_(); continue; }
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            if (moe_idle_should_spin(idle)) { cpu_pause_(); continue; }
+            std::this_thread::sleep_for(std::chrono::microseconds(moe_idle_sleep_us(idle)));
             continue;
         }
         idle = 0;
