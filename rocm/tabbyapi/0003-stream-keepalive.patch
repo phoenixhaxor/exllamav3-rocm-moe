@@ -1,0 +1,36 @@
+diff --git a/endpoints/OAI/utils/chat_completion.py b/endpoints/OAI/utils/chat_completion.py
+index 5c2b350..8b1e9db 100644
+--- a/endpoints/OAI/utils/chat_completion.py
++++ b/endpoints/OAI/utils/chat_completion.py
+@@ -169,6 +169,9 @@ def _compose_response(
+     return response
+ 
+ 
++STREAM_KEEPALIVE_S = 5.0
++
++
+ def _compose_serialize_stream_chunk(
+     request_id: str,
+     generation: Optional[dict] = None,
+@@ -863,7 +866,10 @@ async def stream_generate_chat_completion(
+             )
+             gen_tasks.append(gen_task)
+ 
+-        # Consumer loop
++        # Consumer loop. Tool call text is buffered until the call is complete,
++        # so a long call (e.g. writing a large file) would otherwise send nothing
++        # for minutes and trip client idle timeouts. Send an empty delta instead.
++        last_yield = time()
+         while True:
+             generation = await gen_queue.get()
+ 
+@@ -878,7 +884,8 @@ async def stream_generate_chat_completion(
+                 model_path.name,
+                 return_usage and remaining_n == 1,
+             )
+-            if not is_empty:
++            if not is_empty or time() - last_yield >= STREAM_KEEPALIVE_S:
++                last_yield = time()
+                 yield chunk
+ 
+             # Send usage chunk on completing last choice

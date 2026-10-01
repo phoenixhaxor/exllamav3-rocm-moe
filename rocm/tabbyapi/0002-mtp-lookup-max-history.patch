@@ -1,0 +1,23 @@
+diff --git a/backends/exllamav3/model.py b/backends/exllamav3/model.py
+index a377598..f141927 100644
+--- a/backends/exllamav3/model.py
++++ b/backends/exllamav3/model.py
+@@ -1,3 +1,4 @@
++import os
+ import asyncio
+ import gc
+ import pathlib
+@@ -723,8 +724,11 @@ class ExllamaV3Container:
+             default_draft_tokens = 0
+         batch_draft_args = {
+             "max_batch_size": self.max_batch_size,
+-            "max_history": (
+-                self.draft_num_tokens if self.draft_num_tokens is not None else default_draft_tokens
++            # EXL3_MTP_LOOKUP: prompt-lookup rounds verify up to EXL3_MTP_LOOKUP_MAX drafts, and the recurrent
++            # layers must be able to roll that many back
++            "max_history": max(
++                self.draft_num_tokens if self.draft_num_tokens is not None else default_draft_tokens,
++                int(os.environ.get("EXL3_MTP_LOOKUP_MAX", 5)) if int(os.environ.get("EXL3_MTP_LOOKUP", 0)) else 0,
+             ),
+         }
+ 

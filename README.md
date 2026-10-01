@@ -104,6 +104,27 @@ on 24 GB: its KV cache alone is ~14.4 GB of VRAM, which would push every expert 
 3.05 bpw, more than a 64 GB machine can spare). Engines that do run 1M on 24 GB + 64 GB (Strata, 2-bit experts) keep
 the KV cache in RAM and only the part the attention reads in VRAM; that is not implemented here.
 
+**512K in practice: what it costs.** The box has served the 512K profile to a coding agent since 2026-10-01.
+
+| | 512K (YaRN x2) vs the 192K profile |
+|---|---|
+| gained | prompts up to ~520K tokens (3/3 needles at 399K); long agent sessions no longer hit the limit at 192K |
+| decode | 64 more CPU experts per layer: short code edit 65 vs 80-84 tok/s (-20%); agent turns at 34K context 35-45 tok/s (48-71 observed on the 192K profile at 44-49K) |
+| RAM | ~15 GB available after load instead of ~21 GB |
+| VRAM margin | thin: 438 CPU experts per layer ran out of VRAM in the 400K prefill, 444 holds |
+| quality | YaRN changes the angles at every position; only a 30-question MMLU-Pro sample (no loss) was checked, so small effects on short prompts are not ruled out |
+| first token | a cold 400K-token prompt takes ~5.3 min of prefill (cached prefixes are fast: 5.7K new tokens on a 399K prefix in 23 s) |
+
+Clients time out on long silences. Agent clients commonly abort a stream after ~300 s without an event (omp:
+`PI_STREAM_FIRST_EVENT_TIMEOUT_MS`, `PI_STREAM_IDLE_TIMEOUT_MS`, both 300000 by default). A cold prefill of
+~380K+ tokens is longer than that, and so is a long tool call: TabbyAPI buffers tool-call text until the call is
+complete and sends nothing meanwhile, so an agent writing a whole file (14K tokens, 325 s) was cut off with "stream
+stalled". `rocm/tabbyapi/0003-stream-keepalive.patch` sends an empty delta every 5 s while output is buffered; for
+cold long prompts, raise the client's first-event timeout as well.
+
+Which to run: 262K needs no YaRN and only 12 more CPU experts per layer than 192K; take 512K only when sessions
+actually pass 262K.
+
 ### Capability: Flash-Next 3.05 bpw vs the dense 27B
 
 Same harness for both (`rocm_tests/iqbench.py`, through the TabbyAPI endpoint, thinking on, temperature 0.6 /
@@ -182,7 +203,8 @@ top_p: {override: 0.95, force: false}
 ```
 
 Environment for the prompt-lookup drafts (`max_history` must cover the lookup window, see below):
-`EXL3_MTP_LOOKUP=4 EXL3_MTP_LOOKUP_MAX=4`.
+`EXL3_MTP_LOOKUP=4 EXL3_MTP_LOOKUP_MAX=4`, with `rocm/tabbyapi/0002-mtp-lookup-max-history.patch` applied
+(`install_tabbyapi.sh` applies all patches in `rocm/tabbyapi/`).
 
 Run TabbyAPI with `EXL3_NOGRAPH=mlp,gdn,moe,attn` (MoE models need `moe`: the CPU-offloaded expert path cannot run
 inside a HIP graph, and loading fails with `Graph update failed` in `run_single_expert` otherwise; eager `attn` costs
@@ -790,5 +812,5 @@ is single-stream at 4 bpw (330 tok/s is the 16-stream aggregate).
 ## License and credits
 
 - exllamav3 by turboderp and contributors, MIT License (see [LICENSE](LICENSE)); this fork keeps it.
-- TabbyAPI (AGPL-3.0) is not included; `rocm/tabbyapi/` only contains a patch and config files.
+- TabbyAPI (AGPL-3.0) is not included; `rocm/tabbyapi/` only contains patches and config files.
 - Models by the Qwen team, EXL3 quants and DFlash2 draft by Mia-AiLab (see their model cards for licenses).
