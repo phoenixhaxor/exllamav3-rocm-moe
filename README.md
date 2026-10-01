@@ -567,6 +567,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_MTP_COUPLED` | 1 | Gumbel-coupled MTP drafts under sampling (0 = greedy drafts) |
 | `EXL3_MOE_CPU_SWAP_MIDSTREAM_MAX` | 96 | expert swaps per sweep between forward passes of a long generation (`EXL3_MOE_CPU_SWAP_MIDSTREAM=0`: only between generations) |
 | `EXL3_MMAP_THRESHOLD` | 1048576 | host allocations of at least this many bytes get their own mapping (returned to the OS on free); 0 = glibc default |
+| `EXL3_MOE_IDLE_SLEEP_US` | 50 | CPU MoE standby nap after 1024 empty short naps; 1000 reduces idle wakeups. Range 50–10000 µs; invalid values fall back to 50. Initial spinning/50 µs naps remain unchanged, and new work resets the counter. Longer naps can add up to one nap interval to the first dispatch after extended idle; benchmark the intended workload. |
 | `EXL3_PF_BLOCK_M`, `EXL3_PF_BLOCK_N`, `EXL3_PF_WARPS` | - | Triton prefill tile overrides |
 
 ## Tests and benchmarks (`rocm_tests/`)
