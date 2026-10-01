@@ -115,12 +115,23 @@ the KV cache in RAM and only the part the attention reads in VRAM; that is not i
 | quality | YaRN changes the angles at every position; only a 30-question MMLU-Pro sample (no loss) was checked, so small effects on short prompts are not ruled out |
 | first token | a cold 400K-token prompt takes ~5.3 min of prefill (cached prefixes are fast: 5.7K new tokens on a 399K prefix in 23 s) |
 
-Clients time out on long silences. Agent clients commonly abort a stream after ~300 s without an event (omp:
-`PI_STREAM_FIRST_EVENT_TIMEOUT_MS`, `PI_STREAM_IDLE_TIMEOUT_MS`, both 300000 by default). A cold prefill of
-~380K+ tokens is longer than that, and so is a long tool call: TabbyAPI buffers tool-call text until the call is
-complete and sends nothing meanwhile, so an agent writing a whole file (14K tokens, 325 s) was cut off with "stream
-stalled". `rocm/tabbyapi/0003-stream-keepalive.patch` sends an empty delta every 5 s while output is buffered; for
-cold long prompts, raise the client's first-event timeout as well.
+Clients time out on long silences. Agent clients commonly abort a stream after 300-600 s without progress. A
+cold prefill of ~380K+ tokens is longer than that, and so is a long tool call: TabbyAPI buffers tool-call text until
+the call is complete and streams nothing meanwhile, so an agent writing a whole file (20-30K tokens at 120K context,
+7-12 min) was cut off with "stream stalled". Raise the client's limits; for omp, per provider in `models.yml`:
+
+```yaml
+providers:
+  tabby:
+    compat:
+      streamIdleTimeoutMs: 3600000
+      streamFirstEventTimeoutMs: 1800000
+```
+
+(or the `PI_STREAM_IDLE_TIMEOUT_MS` / `PI_STREAM_FIRST_EVENT_TIMEOUT_MS` environment variables).
+`rocm/tabbyapi/0003-stream-keepalive.patch` sends an empty delta every 5 s while output is buffered, which keeps
+proxies and plain idle-socket timeouts from closing the connection, but clients that only count non-empty deltas as
+progress (omp does) still need the higher limit.
 
 Which to run: 262K needs no YaRN and only 12 more CPU experts per layer than 192K; take 512K only when sessions
 actually pass 262K.
