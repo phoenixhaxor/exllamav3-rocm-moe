@@ -250,6 +250,11 @@ def _qsa_sparse_split_kernel(
         tl.store(partial_ml + ml_base + rows * 2 + 1, l)
 
 
+import os as _os
+_QSA_BN = int(_os.environ.get("EXL3_QSA_BN", 32))
+_QSA_NW = int(_os.environ.get("EXL3_QSA_NW", 4))
+_QSA_NS = int(_os.environ.get("EXL3_QSA_NS", 1))   # 1: 701 -> 483 ms per 8192-token chunk (16K context) on gfx1100
+
 _sm_counts = {}
 
 def _get_sms(dev):
@@ -290,7 +295,7 @@ def qsa_sparse_attend_rows(
         h32 = q
     group = H // kvh
     BLOCK_H = 16
-    BLOCK_N = 32
+    BLOCK_N = _QSA_BN
     h_blocks = triton.cdiv(group, BLOCK_H)
     programs = R * kvh * h_blocks
     K_pad = indices.shape[1]
@@ -318,7 +323,7 @@ def qsa_sparse_attend_rows(
             head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
             BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1 if paged else 0,
             QCK = k_bits, QCV = v_bits,
-            num_warps = 4, num_stages = 2,
+            num_warps = _QSA_NW, num_stages = _QSA_NS,
         )
         rows_sub, d_sub = combine_subtiles(BLOCK_H, hd)
         _paged_attn_decode_combine_kernel[(programs, (BLOCK_H // rows_sub) * (hd // d_sub))](

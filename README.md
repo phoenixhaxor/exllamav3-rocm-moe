@@ -56,7 +56,8 @@ A Q4 cache for the MTP layer saves almost nothing (one attention layer) and did 
 ### Current serving profile (2026-09-29)
 
 3.05 bpw, 192K context, Q8 KV cache, 8192-token prefill chunks, 380 of 512 experts per layer on the CPU (132 on the
-GPU), MTP 2 tokens with Gumbel-coupled drafts and prompt lookup, vision on with `vision_offload`, TabbyAPI:
+GPU), MTP 2 tokens with Gumbel-coupled drafts and prompt lookup, vision on with `vision_offload`, TabbyAPI (the box
+now serves the 512K profile of the long-context section below; this table is the 192K one):
 
 | | |
 |---|---|
@@ -219,6 +220,13 @@ mostly measures the SSD), the chunk is bound by GPU work. The batched expert tie
 (the per-expert path's precision) with the routing weights applied in fp32 before the accumulation
 (`EXL3_MOE_RECON_DOWN_HALF`): rocBLAS runs its fp32-output GEMM on a SIMD kernel and the fp16-output one on the
 matrix cores. 32K-token prompts, warm: 1,325 -> 1,415 tok/s.
+
+The QSA sparse attention of a prefill chunk runs the gathered decode kernel per query row; a launch-parameter
+sweep on gfx1100 (block 16/32/64/128, 2/4/8 warps, 1/2/3 stages) found single-stage software pipelining best:
+701 -> 483 ms per 8192-token chunk at 16K of context (`EXL3_QSA_NS`, default 1; `EXL3_QSA_BN`, `EXL3_QSA_NW`), and
+1,410 -> 1,480 tok/s on warm 32K prompts. Streaming every routed expert to the GPU instead of leaving the cold tail
+to the CPU (`EXL3_MOE_STREAM_T=1`, what Strata does from 1024-token chunks) is 20-30% slower here: a 16-core CPU
+computes the tail in parallel with the GPU.
 
 Host memory: every prefill stashes recurrent checkpoints (~3 MB per GDN layer each) that are freed again on eviction.
 On glibc's brk heap those freed chunks stayed resident, so the server's anonymous RSS grew by ~0.3-0.5 GB per
@@ -530,6 +538,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_NOGRAPH` | - (`mlp,gdn` in `run_tabbyapi.sh`) | modules (`mlp`, `gdn`, `moe`, `attn`) that decode eagerly instead of through a HIP graph; MoE models with CPU experts need `moe` |
 | `EXL3_WATCHDOG_S` | 300 | a generator iteration running longer than this dumps all stacks and exits the process (0 = off) |
 | `EXL3_MTP_LOOKUP`, `EXL3_MTP_LOOKUP_MAX` | 0, 5 | prompt lookup beside MTP drafting: minimum suffix match (0 = off) and draft length |
+| `EXL3_QSA_NS`, `EXL3_QSA_BN`, `EXL3_QSA_NW` | 1, 32, 4 | launch parameters of the QSA sparse attention kernel used by prefill |
 | `EXL3_MOE_RECON_DOWN_HALF` | 1 | batched expert down projection in fp16 (matrix-core GEMM), accumulated in fp32 |
 | `EXL3_GDN_CONV_CL` | 1 | long-sequence DeltaNet conv reads the projection in place (no transpose / bf16 copies) |
 | `EXL3_NGRAM_PREFETCH_NEXT` | 1 | stage the next prefill chunk's n-gram rows while the current chunk runs |
