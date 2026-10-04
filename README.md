@@ -179,10 +179,11 @@ streaming costs ~3% of decode speed at short contexts (the resolve and copy laun
 than repay it. The RAM side: the K/V take ~9 GB of pinned RAM at 512K, and the experts that move to the GPU free ~8 GB,
 so ~1.5 GB less is available. Without the variable, nothing changes.
 
-**Served profile since 2026-10-05:** 512K (YaRN x2), `EXL3_KV_STREAM=1`, `cpu_moe_split_experts: 362`,
-`max_batch_size: 2` (two requests decode together; the second slot needs 6 more CPU experts per layer than one).
-The 400K needle run on this exact setting: 3/3, prefill 303 s (1,317 tok/s), decode at that context 42 / 35 tok/s,
-~10 GB of RAM still available afterwards.
+**Served profile since 2026-10-05:** 512K (YaRN x2), `EXL3_KV_STREAM=1`, `cpu_moe_split_experts: 368`,
+`max_batch_size: 3` (up to three requests decode together; each slot beyond the first needs ~6 more CPU experts per
+layer). The 400K needle run on this exact setting: 3/3, prefill 370 s (1,079 tok/s), decode at that context
+44 / 35 tok/s, short code edit 66 tok/s, ~10.5 GB of RAM still available afterwards. (Two slots at 362: 3/3,
+303 s, 42 / 35 tok/s.)
 
 ### Several requests at once (`max_batch_size: 2`)
 
