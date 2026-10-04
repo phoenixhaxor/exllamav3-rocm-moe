@@ -206,6 +206,17 @@ short request that arrives while a long prompt is being read (`rocm_tests/conc_l
 126K-token prompt) no longer waits for the whole prefill: the generator interleaves it between the prompt's chunks,
 and both progress.
 
+Three slots (`max_batch_size: 3`, 368 CPU experts per layer) load and work, but add no throughput: one request
+alone runs the same (50-52 code / 40-45 prose tok/s), three at once decode at 22-23 tok/s each, 64 tok/s together,
+the same total as two. A third slot only trades the third request's wait for a slower run of all three.
+
+**1M tokens with Q8 KV does not fit a 60 GB machine safely.** With a YaRN x4 directory (`factor: 4.0`,
+`max_position_embeddings: 1048576`) and KV streaming, the 1M profile loads at 368 CPU experts per layer (24.1 GB of
+VRAM, short code edit 66-67 tok/s), but the pinned K/V of 1M tokens (~18 GB with the MTP layer) leaves only ~3.8 GB
+of RAM available after load, and starting a ~980K-token request took it under 3 GB within a minute (the test stopped
+the server there, before the kernel's OOM handling could). It needs less RAM per token (a 6-bit KV cache saves ~3.6
+GB at 1M) or more RAM.
+
 ### Capability: Flash-Next 3.05 bpw vs the dense 27B
 
 Same harness for both (`rocm_tests/iqbench.py`, through the TabbyAPI endpoint, thinking on, temperature 0.6 /

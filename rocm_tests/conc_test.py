@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# Concurrency A/B over the Tabby API: each request alone, then both at once.
+# Concurrency A/B over the Tabby API: each request alone, then N at once (argv[3], 2 or 3).
 # Streams, so each request reports its own first-token time and decode rate.
 import json, sys, threading, time, urllib.request
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8098"
 TAG = sys.argv[2] if len(sys.argv) > 2 else ""
+NCONC = int(sys.argv[3]) if len(sys.argv) > 3 else 2
 N = 800
 
 PROMPTS = {
@@ -13,6 +14,8 @@ PROMPTS = {
             "using unittest. Output only the code.",
     "prose": "Write a long, detailed essay about the history of the printing press and how it changed "
              "science, religion and politics in Europe between 1450 and 1650.",
+    "explain": "Explain in depth how TCP congestion control works, from slow start and AIMD to CUBIC and BBR, "
+               "with worked numeric examples.",
 }
 
 def run(name, out, t_start):
@@ -55,5 +58,7 @@ def scenario(names):
     print(f"{TAG} [{'+'.join(names)}] aggregate {tot / wall:.1f} tok/s over {wall:.1f}s wall", flush = True)
 
 run("code", {}, time.time())   # warm-up (placement, page cache)
+names = list(PROMPTS)[:NCONC]
 for rep in range(2):
-    scenario(["code"]); scenario(["prose"]); scenario(["code", "prose"])
+    for n in names: scenario([n])
+    scenario(names)
