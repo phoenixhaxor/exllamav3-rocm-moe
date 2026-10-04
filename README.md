@@ -179,11 +179,10 @@ streaming costs ~3% of decode speed at short contexts (the resolve and copy laun
 than repay it. The RAM side: the K/V take ~9 GB of pinned RAM at 512K, and the experts that move to the GPU free ~8 GB,
 so ~1.5 GB less is available. Without the variable, nothing changes.
 
-**Served profile since 2026-10-05:** 512K (YaRN x2), `EXL3_KV_STREAM=1`, `cpu_moe_split_experts: 368`,
-`max_batch_size: 3` (up to three requests decode together; each slot beyond the first needs ~6 more CPU experts per
-layer). The 400K needle run on this exact setting: 3/3, prefill 370 s (1,079 tok/s), decode at that context
-44 / 35 tok/s, short code edit 66 tok/s, ~10.5 GB of RAM still available afterwards. (Two slots at 362: 3/3,
-303 s, 42 / 35 tok/s.)
+**Served profile since 2026-10-05:** 512K (YaRN x2), `EXL3_KV_STREAM=1`, `cpu_moe_split_experts: 380`,
+`max_batch_size: 5` (up to five requests decode together; each slot beyond the first needs ~6 more CPU experts per
+layer). The 400K needle run on this exact setting: 3/3, prefill 350 s (1,140 tok/s), decode at that context
+42 / 33 tok/s, short code edit 66 tok/s, ~9.4 GB of RAM still available afterwards.
 
 ### Several requests at once (`max_batch_size: 2`)
 
@@ -209,7 +208,9 @@ and both progress.
 
 Three slots (`max_batch_size: 3`, 368 CPU experts per layer) load and work, but add no throughput: one request
 alone runs the same (50-52 code / 40-45 prose tok/s), three at once decode at 22-23 tok/s each, 64 tok/s together,
-the same total as two. A third slot only trades the third request's wait for a slower run of all three.
+the same total as two. A third slot only trades the third request's wait for a slower run of all three. Four slots (374) and five (380)
+behave the same way: alone 45-50 code / 36-45 other tok/s, four at once 17-19 tok/s each and five at once 13-14 each,
+60-64 tok/s in total; the box's decode throughput is the ceiling, the slots decide who waits.
 
 **1M tokens with Q8 KV does not fit a 60 GB machine safely.** With a YaRN x4 directory (`factor: 4.0`,
 `max_position_embeddings: 1048576`) and KV streaming, the 1M profile loads at 368 CPU experts per layer (24.1 GB of

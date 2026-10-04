@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Concurrency A/B over the Tabby API: each request alone, then N at once (argv[3], 2 or 3).
+# Concurrency A/B over the Tabby API: each request alone, then N at once (argv[3], 2 to 5).
 # Streams, so each request reports its own first-token time and decode rate.
 import json, sys, threading, time, urllib.request
 
@@ -16,6 +16,10 @@ PROMPTS = {
              "science, religion and politics in Europe between 1450 and 1650.",
     "explain": "Explain in depth how TCP congestion control works, from slow start and AIMD to CUBIC and BBR, "
                "with worked numeric examples.",
+    "story": "Write a long short story about a lighthouse keeper on a remote island who finds a message in a "
+             "bottle, with vivid detail and dialogue.",
+    "sql": "Design a PostgreSQL schema for a multi-tenant invoicing system with migrations, indexes and example "
+           "queries for monthly revenue per tenant. Output SQL with comments.",
 }
 
 def run(name, out, t_start):
