@@ -285,8 +285,7 @@ def qsa_sparse_attend_rows(
     R, H, hd = q.shape
     if qc is not None:
         k_scales, v_scales, k_bits, v_bits = qc
-        assert n_kv_heads is not None and block_table is not None, \
-            "qsa_sparse_attend_rows: packed K/V requires n_kv_heads and a block table"
+        assert n_kv_heads is not None, "qsa_sparse_attend_rows: packed K/V requires n_kv_heads"
         kvh = n_kv_heads
         h32 = _get_h32(q.device)
     else:

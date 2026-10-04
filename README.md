@@ -99,10 +99,8 @@ cached prefix; 3.05 bpw heretic build, 8192-token prefill chunks, MTP with promp
 | MMLU-Pro, first 30 questions | 25/30 | (same model) | 25/30 |
 
 YaRN changes the angles at every position, so a scaled run is a slightly different model even on short prompts
-(the MMLU-Pro sample shows no loss); enable it only when you need more than 262K. **1M tokens does not fit this way**
-on 24 GB: its KV cache alone is ~14.4 GB of VRAM, which would push every expert to the CPU (46.7 GB of pinned RAM at
-3.05 bpw, more than a 64 GB machine can spare). Engines that do run 1M on 24 GB + 64 GB (Strata, 2-bit experts) keep
-the KV cache in RAM and only the part the attention reads in VRAM; that is not implemented here.
+(the MMLU-Pro sample shows no loss); enable it only when you need more than 262K. With the KV cache in VRAM, 1M
+tokens does not fit on 24 GB (its KV cache alone is ~14.4 GB); KV streaming (next section) moves it to RAM.
 
 **512K in practice: what it costs.** The box has served the 512K profile to a coding agent since 2026-10-01.
 
@@ -135,6 +133,78 @@ progress (omp does) still need the higher limit.
 
 Which to run: 262K needs no YaRN and only 12 more CPU experts per layer than 192K; take 512K only when sessions
 actually pass 262K.
+
+### KV streaming: the context's K/V in RAM (`EXL3_KV_STREAM=1`)
+
+The QSA attention reads only ~2K selected positions per query (512 indexer blocks of 4 tokens plus the newest
+tokens), so the full K/V of a long context does not have to sit in VRAM. With `EXL3_KV_STREAM=1`, every quantized QSA
+cache layer of at least 64K tokens (the main model's 12 attention layers and the MTP layer) keeps its K/V and the raw
+indexer keys in pinned, device-mapped host memory, in exactly the resident layout. The design follows Strata's KV
+streaming (MIT):
+
+- **Decode and verification** read a VRAM pool of slots, one slot per 4-token block (8192 slots = the 32K
+  most recently selected positions, ~35 MB per layer). After the block selection, one kernel
+  (`kv_stream_resolve`, one workgroup) stamps the blocks it finds, claims the missing ones, takes victims with a clock
+  sweep that never evicts a block the same call reads, and rewrites the selection as slot rows; a second kernel copies
+  the missing blocks from the host copy. Slots are keyed by physical cache block, and every write to the host copy
+  (new tokens, page copies for prompt caching) drops the slots it touches, so a slot is never stale. Measured miss rate
+  in generation: ~0.4% of lookups.
+- **Prefill chunks** copy the job's pages into one VRAM image of a layer, shared by all streamed layers (DMA for runs
+  of consecutive pages, a gather kernel for scattered ones; ~28 GB/s, ~15 ms per layer at 400K tokens), and read it
+  with the unchanged sparse prefill kernel.
+- Contexts below the sparse threshold (2051 tokens) run through the slot reader with every position selected,
+  which is exactly dense attention, instead of reading the host copy over PCIe on every step.
+- The pooled indexer plane, which every block selection scans, stays in VRAM (64 bytes per token per layer).
+
+The attention reads exactly the values it would read from a resident cache: with `EXL3_KV_STREAM_VERIFY=1` every call
+also runs the reader straight over the host copy and compares, and 761K query rows (prefill chunks, verification
+windows, dense and sparse regimes, prompt-cache reuse) matched bit for bit (`rocm_tests/kv_stream_check.py`).
+
+At 512K it frees ~8 GB of VRAM (K/V 6.9 GB, raw indexer keys 1.6 GB, the MTP layer's 0.7 GB, less 0.6 GB of staging
+and 0.5 GB of slots), which holds 88 more experts per layer on the GPU. Measured on the same day, through TabbyAPI,
+same tests as the table above:
+
+| 512K (YaRN x2) | KV in VRAM | KV streaming |
+|---|---|---|
+| CPU experts per layer | 444 | **356** |
+| VRAM / RAM available after load | 24.5 GB / 15.5 GB | 24.2 GB / 13.9 GB |
+| decode, short code edit | 61.5-61.7 tok/s | **67.3-68.0 tok/s** |
+| needle test at 398,902 tokens | 3/3 | 3/3 |
+| prefill of that prompt | 754 s (529 tok/s) | 401-445 s (897-996 tok/s) |
+| decode at that context | 42.0 / 35.7 tok/s | 43-44 / 40-41 tok/s |
+
+The cold 400K prefill varies a lot between runs on this machine (the KV-in-VRAM profile did it in 320 s on
+2026-10-01 and in 754 s here); read the prefill row as "not slower", not as a 1.7x gain. At the same expert split,
+streaming costs ~3% of decode speed at short contexts (the resolve and copy launches); the extra GPU experts more
+than repay it. The RAM side: the K/V take ~9 GB of pinned RAM at 512K, and the experts that move to the GPU free ~8 GB,
+so ~1.5 GB less is available. Without the variable, nothing changes.
+
+**Served profile since 2026-10-05:** 512K (YaRN x2), `EXL3_KV_STREAM=1`, `cpu_moe_split_experts: 362`,
+`max_batch_size: 2` (two requests decode together; the second slot needs 6 more CPU experts per layer than one).
+The 400K needle run on this exact setting: 3/3, prefill 303 s (1,317 tok/s), decode at that context 42 / 35 tok/s,
+~10 GB of RAM still available afterwards.
+
+### Several requests at once (`max_batch_size: 2`)
+
+Agent clients run sub-agents in parallel: over three days of one coding agent on this box, 26% of the requests
+arrived while another one was running (up to five deep), and with `max_batch_size: 1` they waited 20 s at the median
+and up to 9 minutes. exllamav3's generator batches jobs, and the eager QSA path handles several sequences, so two
+slots need no engine change. Measured through TabbyAPI on the 512K profile, sampled 800-token answers with thinking
+(`rocm_tests/conc_test.py`), each case twice:
+
+| | 1 slot, KV in VRAM (444) | 2 slots, KV in VRAM (444) | 2 slots + KV streaming (362) |
+|---|---|---|---|
+| one request alone: code / prose | 41-43 / 35-43 tok/s | 41-46 / 37-41 tok/s | **50-53 / 41-51 tok/s** |
+| two at once: each | ~42 (the second waits for the first) | 27-29 tok/s | 33-41 tok/s |
+| two at once: total | 41-42 tok/s | 51-52 tok/s | **63-67 tok/s** |
+| the second request's first token | 19.3 s | 1.6 s | 1.5 s |
+
+A request alone runs as fast with two slots as with one. Two at once each decode slower than alone, since the
+CPU experts and the attention now serve two sequences per step, but together they deliver ~50% more tokens and
+neither waits for the other. Speculative drafts stay on for both (coupled drafts only apply to a single job). A
+short request that arrives while a long prompt is being read (`rocm_tests/conc_long.py`: a code edit 15 s into a
+126K-token prompt) no longer waits for the whole prefill: the generator interleaves it between the prompt's chunks,
+and both progress.
 
 ### Capability: Flash-Next 3.05 bpw vs the dense 27B
 
@@ -580,6 +650,10 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_MMAP_THRESHOLD` | 1048576 | host allocations of at least this many bytes get their own mapping (returned to the OS on free); 0 = glibc default |
 | `EXL3_MOE_IDLE_SLEEP_US` | 50 | CPU MoE standby nap after 1024 empty short naps; 1000 reduces idle wakeups. Range 50–10000 µs; invalid values fall back to 50. Initial spinning/50 µs naps remain unchanged, and new work resets the counter. Longer naps can add up to one nap interval to the first dispatch after extended idle; benchmark the intended workload. |
 | `EXL3_PF_BLOCK_M`, `EXL3_PF_BLOCK_N`, `EXL3_PF_WARPS` | - | Triton prefill tile overrides |
+| `EXL3_KV_STREAM` | 0 | 1 = K/V of quantized QSA cache layers in pinned RAM, decode through a VRAM slot cache, prefill through a staged layer image |
+| `EXL3_KV_STREAM_MIN` | 65536 | smallest cache (tokens) that streams |
+| `EXL3_KV_STREAM_SLOTS` | 8192 | VRAM slots per streamed layer (4 tokens each) |
+| `EXL3_KV_STREAM_STATS`, `EXL3_KV_STREAM_VERIFY` | 0, 0 | print slot hit counters every N calls; check every streamed read against the host copy (debug, slow) |
 
 ## Tests and benchmarks (`rocm_tests/`)
 
@@ -606,6 +680,10 @@ verification from ~45 ms to ~14 ms per round.
 | `kprof_prefill.py -m <model> [--chunk N]` | kernel and aten-op profile (with shapes) of one prefill chunk |
 | `prefill_bench.py -m <model> [--chunk N] [--mtp] [--warm]` | prefill tok/s through the Generator on fresh prompts, with n-gram prefetch hit counts |
 | `dist_check.py -m <model>` | token-distribution check of coupled vs uncoupled speculative sampling |
+| `kv_stream_unit.py` | KV streaming kernels vs a torch reference: multi-step selections, eviction pressure, invalidating writes, page copies |
+| `kv_stream_check.py -m <model> --stream 0\|1 [--out F] [--ref F]` | greedy jobs (long prompt, shared prefix, recycled pages) with streaming off / on; with `EXL3_KV_STREAM_VERIFY=1` the bit-exact read check |
+| `kv_stage_bench.py` | staging bandwidth: DMA runs vs the page-gather kernel |
+| `conc_test.py <url> <tag>`, `conc_long.py <url> <tag>` | concurrency through the API: two sampled requests alone and at once (first token, per-request and total tok/s); a short edit arriving during a long prefill (needs `max_tokens` honoured) |
 | `iqbench_data.py`, `iqbench.py <url> <name>` | capability benchmark through an OpenAI endpoint: MMLU-Pro, MATH-500 level 4-5, HumanEval (executed), thinking on, resumable |
 
 Model paths default to `models/...` or `EXL3_MODEL_DIR` / `EXL3_DRAFT_DIR`. Greedy speculative decoding
@@ -826,3 +904,5 @@ is single-stream at 4 bpw (330 tok/s is the 16-stream aggregate).
 - exllamav3 by turboderp and contributors, MIT License (see [LICENSE](LICENSE)); this fork keeps it.
 - TabbyAPI (AGPL-3.0) is not included; `rocm/tabbyapi/` only contains patches and config files.
 - Models by the Qwen team, EXL3 quants and DFlash2 draft by Mia-AiLab (see their model cards for licenses).
+- The KV streaming design (host-authoritative K/V, block slots with a clock sweep, staged prefill) follows Strata by
+  Niko1221 and contributors (MIT); the implementation here is written for exllamav3's paged cache and Triton readers.

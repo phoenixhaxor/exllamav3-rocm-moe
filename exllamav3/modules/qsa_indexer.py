@@ -679,6 +679,7 @@ class QSAIndexer(Module):
         q_idx: torch.Tensor,
         block_table: torch.Tensor,
         cache_seqlens_cpu: torch.Tensor,
+        dense: bool = False,
     ) -> torch.Tensor:
         """
         Sparse paged attention through the gathered-GQA kernel: per-row selection over the
@@ -692,7 +693,48 @@ class QSAIndexer(Module):
         from .attention_fn.qsa_triton import qsa_sparse_attend_rows
         from ..cache.quant import CacheLayer_quant
         bsz, seq = q.shape[:2]
-        indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
+        if dense:
+            # Every position up to each row's own (the dense regime: the context is shorter than K_pad)
+            pos = cache_seqlens_cpu.to(device = q.device, dtype = torch.int).view(bsz, 1) + \
+                torch.arange(seq, device = q.device, dtype = torch.int).view(1, seq)
+            ar = torch.arange(self.k_pad(), device = q.device, dtype = torch.int).view(1, -1)
+            indices = torch.where(ar <= pos.view(-1, 1), ar, -1).contiguous()
+        else:
+            indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
+        kvs = getattr(layer, "kv_stream", None)
+        if kvs is not None:
+            # Streamed layer: decode/verify rows read VRAM slots holding the selected blocks; a prefill
+            # chunk reads the job's pages staged into the shared VRAM layer image
+            qk, sk, qv, sv, kb, vb = layer.get_qkv()
+            R = bsz * seq
+            q_rows = q.reshape(R, attn.num_q_heads, attn.head_dim).contiguous()
+            bt_rows = None
+            if kvs.slot_fits(R, indices.shape[1]):
+                rows = kvs.resolve(indices, block_table, seq)
+                o = qsa_sparse_attend_rows(
+                    q_rows, kvs.s_qk, kvs.s_qv, rows, attn.sm_scale,
+                    qc = (kvs.s_sk, kvs.s_sv, kb, vb), n_kv_heads = attn.num_kv_heads,
+                )
+            else:
+                st_qk, st_qv, st_sk, st_sv = kvs.stage(block_table, cache_seqlens_cpu, seq)
+                bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
+                    .reshape(R, -1).contiguous()
+                o = qsa_sparse_attend_rows(
+                    q_rows, st_qk, st_qv, indices, attn.sm_scale,
+                    block_table = bt_rows, page_size = st_qk.shape[1],
+                    qc = (st_sk, st_sv, kb, vb), n_kv_heads = attn.num_kv_heads,
+                )
+            if kvs.verify:
+                # Debug (EXL3_KV_STREAM_VERIFY=1): the same reader straight over the host copy must agree bit for bit
+                if bt_rows is None:
+                    bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1).reshape(R, -1).contiguous()
+                o_ref = qsa_sparse_attend_rows(
+                    q_rows, qk, qv, indices, attn.sm_scale,
+                    block_table = bt_rows, page_size = qk.shape[1],
+                    qc = (sk, sv, kb, vb), n_kv_heads = attn.num_kv_heads,
+                )
+                kvs.verify_result(o, o_ref, R)
+            return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
             .reshape(bsz * seq, -1).contiguous()
         if isinstance(layer, CacheLayer_quant):

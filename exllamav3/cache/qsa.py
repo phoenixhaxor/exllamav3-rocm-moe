@@ -6,6 +6,7 @@ from .cache import CacheLayer
 from .fp16 import CacheLayer_fp16
 from .quant import CacheLayer_quant
 from ..constants import PAGE_SIZE
+from exllamav3.ext import exllamav3_ext as ext
 
 
 class QSAPlanes:
@@ -99,6 +100,55 @@ class CacheLayer_qsa_quant(QSAPlanes, CacheLayer_quant):
     ):
         super().__init__(config, attention, cache_id, max_num_tokens, k_bits, v_bits, compand_a)
         self._init_planes(attention, max_num_tokens)
+        self.kv_stream = None
+
+    @override
+    def alloc(self, device: torch.device):
+        from .kv_stream import KVStream, kv_stream_enabled, kv_stream_min
+        if not (kv_stream_enabled and self.shape and self.compand_a == 0.0 and
+                self.max_num_tokens >= kv_stream_min):
+            return super().alloc(device)
+        # Streamed: K/V and the raw indexer keys in pinned, device-mapped host memory, read and written
+        # through the mapping; the pooled plane (scanned by every block selection) stays in VRAM
+        self.device = device
+        di = torch.device(device).index
+        self.qk = ext.kv_host_alloc(list(self.qshape_k), torch.int, di)
+        self.qv = ext.kv_host_alloc(list(self.qshape_v), torch.int, di)
+        self.sk = ext.kv_host_alloc(list(self.qshape_s), torch.half, di)
+        self.sv = ext.kv_host_alloc(list(self.qshape_s), torch.half, di)
+        self.raw_k = ext.kv_host_alloc(list(self.raw_k_shape), torch.half, di)
+        self.pooled = torch.zeros(self.pooled_shape, dtype = torch.half, device = device)
+        self.kv_stream = KVStream(self, device)
+
+    @override
+    def free(self):
+        super().free()
+        self.kv_stream = None
+
+    @override
+    def update_kv_direct(self, cache_seqlens, block_table, k, v, length):
+        super().update_kv_direct(cache_seqlens, block_table, k, v, length)
+        if self.kv_stream is not None:
+            self.kv_stream.invalidate(cache_seqlens, block_table, length)
+
+    @override
+    def update_kv(self, cache_seqlens, block_table, k, v, length):
+        super().update_kv(cache_seqlens, block_table, k, v, length)
+        if self.kv_stream is not None:
+            self.kv_stream.invalidate(cache_seqlens, block_table, length)
+
+    @override
+    def copy_page(self, source, from_page: int, to_page: int, num_tokens: int):
+        super().copy_page(source, from_page, to_page, num_tokens)
+        if self.kv_stream is not None:
+            self.kv_stream.invalidate_page(to_page)
+
+    @override
+    def storage_size(self):
+        if self.kv_stream is None:
+            return super().storage_size()
+        return sum(t.numel() * t.element_size() for t in self.kv_stream.vram_tensors()) + \
+            self.pooled.numel() * self.pooled.element_size()
 
     @override
     def tp_export(self, plan):

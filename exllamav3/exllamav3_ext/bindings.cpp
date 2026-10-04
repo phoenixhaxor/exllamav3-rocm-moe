@@ -70,6 +70,7 @@ void exl3_rdna3_act_epi_set(int enable);
 #include "dsv4_compress.cuh"
 #include "dsv4_pool_quant.cuh"
 #include "dsa_topk.cuh"
+#include "kv_stream.cuh"
 #include "hc_mix.cuh"
 #include "ple.cuh"
 #include "ngram.cuh"
@@ -116,6 +117,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("dsv4_pool_quant_scatter", &dsv4_pool_quant_scatter, "dsv4_pool_quant_scatter");
     m.def("dsv4_ring_append", &dsv4_ring_append, "dsv4_ring_append");
     m.def("dsa_topk", &dsa_topk, "dsa_topk");
+    m.def("kv_host_alloc", &kv_host_alloc, "kv_host_alloc");
+    m.def("kv_stream_resolve", &kv_stream_resolve, "kv_stream_resolve");
+    m.def("kv_stream_copy", &kv_stream_copy, "kv_stream_copy");
+    m.def("kv_stream_invalidate", &kv_stream_invalidate, "kv_stream_invalidate");
+    m.def("kv_stream_invalidate_range", &kv_stream_invalidate_range, "kv_stream_invalidate_range");
+    m.def("kv_stage_pages", &kv_stage_pages, "kv_stage_pages");
+    m.def("kv_stage_runs", &kv_stage_runs, "kv_stage_runs");
     m.def("dsa_topk_tile", &dsa_topk_tile, "dsa_topk_tile");
     m.def("dsa_topk_merge_tiles", &dsa_topk_merge_tiles, "dsa_topk_merge_tiles");
     m.def("hc_mix", &hc_mix, "hc_mix");

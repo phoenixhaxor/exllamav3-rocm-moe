@@ -724,6 +724,7 @@ def build_bc_attn(module, layer):
     if not (
         _module_eligible(m) and
         isinstance(layer, (CacheLayer_quant, CacheLayer_fp16)) and
+        getattr(layer, "kv_stream", None) is None and   # streamed K/V: eager readers only
         (not isinstance(layer, CacheLayer_quant) or (
             layer.compand_a == 0.0 and layer.qk is not None and
             layer.qk.device == torch.device(m.device)

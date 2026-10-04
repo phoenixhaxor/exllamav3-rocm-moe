@@ -1106,9 +1106,12 @@ class Attention(Module):
             _sim_kvq_inplace(k, simulate_kv_quant[0], sq_ca)
             _sim_kvq_inplace(v, simulate_kv_quant[1], sq_ca)
 
-        if qsa_sparse:
+        if qsa_sparse or getattr(qsa_layer, "kv_stream", None) is not None:
+            # A streamed layer runs its dense regime through the same reader too, over every position (exactly
+            # dense attention), so short contexts also read VRAM slots instead of the host copy
             qsa_layer.update_kv_direct(cache_seqlens, block_table, k, v, seqlen)
-            o = self.qsa_indexer.sparse_attend(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu)
+            o = self.qsa_indexer.sparse_attend(qsa_layer, self, q, qsa_q_idx, block_table, qsa_seqlens_cpu,
+                                               dense = not qsa_sparse)
         else:
             # QSA dense regime: the past is bounded by the sparse threshold, which lets the
             # quantized-cache prefill size its staging to the window instead of the job's pages
