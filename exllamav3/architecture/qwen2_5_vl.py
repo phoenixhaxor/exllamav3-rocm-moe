@@ -6,7 +6,7 @@ from ..model.config import Config
 from ..model.model import Model
 from ..util.rope import RopeStyle, RopeSettings, RoPE
 from .mm_processing.common import convert_to_rgb, normalize_image
-from .mm_processing.qwen2 import get_qwen2_window_index, qwen2_smart_resize, qwen2_position_embedding_grid_2d
+from .mm_processing.qwen2 import qwen2_pad_small, get_qwen2_window_index, qwen2_smart_resize, qwen2_position_embedding_grid_2d
 from ..util.file import read_dict,  no_default
 from ..modules import (
     TransformerBlock,
@@ -301,6 +301,7 @@ class Qwen2_5VLVisionModel(Model):
 
         # Convert to RGB and resize as necessary
         images = [convert_to_rgb(image) for image in images]
+        images = qwen2_pad_small(images, pp.patch_size * v.spatial_merge_size, image_mean)
 
         old_size = images[0].size
         assert all(old_size == frame.size for frame in images), \

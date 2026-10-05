@@ -48,6 +48,28 @@ def get_qwen2_window_index(grid_thw, window_size, spatial_merge_size, patch_size
     return window_index, cu_window_seqlens
 
 
+def qwen2_pad_small(images: list, factor: int, image_mean: tuple, max_ratio: float = 200):
+    """
+    Pad (RGB) images whose short side is below `factor`, or whose aspect ratio exceeds `max_ratio`, up to the
+    smallest size qwen2_smart_resize accepts, instead of rejecting them (a 1568x16 strip used to fail the whole
+    request). The content stays at the top left at its original scale; the fill is the normalization mean, i.e.
+    zero after normalizing.
+    """
+    w, h = images[0].size
+    nw = max(w, factor, math.ceil(h / max_ratio))
+    nh = max(h, factor, math.ceil(w / max_ratio))
+    if (nw, nh) == (w, h):
+        return images
+    from PIL import Image
+    fill = tuple(round(m * 255) for m in image_mean)
+    padded = []
+    for image in images:
+        canvas = Image.new("RGB", (nw, nh), fill)
+        canvas.paste(image, (0, 0))
+        padded.append(canvas)
+    return padded
+
+
 def qwen2_smart_resize(
     size: tuple,
     factor: int = 28,
