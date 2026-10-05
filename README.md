@@ -209,7 +209,8 @@ Three slots (`max_batch_size: 3`, 368 CPU experts per layer) load and work, but 
 alone runs the same (50-52 code / 40-45 prose tok/s), three at once decode at 22-23 tok/s each, 64 tok/s together,
 the same total as two. A third slot only trades the third request's wait for a slower run of all three. Four slots (374) and five (380)
 behave the same way: alone 45-50 code / 36-45 other tok/s, four at once 17-19 tok/s each and five at once 13-14 each,
-60-64 tok/s in total; the box's decode throughput is the ceiling, the slots decide who waits.
+60-64 tok/s in total; the box's decode throughput is the ceiling, the slots decide who waits. (Without speculative
+drafts beside other jobs, below, three at once reach 74-75 and five 82-83 tok/s.)
 
 **1M tokens with Q8 KV does not fit a 60 GB machine safely.** With a YaRN x4 directory (`factor: 4.0`,
 `max_position_embeddings: 1048576`) and KV streaming, the 1M profile loads at 368 CPU experts per layer (24.1 GB of
@@ -252,6 +253,23 @@ whole length. `rocm_tests/prune_api.py` (a 100K conversation built over 30 turns
 reused nothing and took 71.8 s to the first token; the ladder resumed from 49,152 and took 39.6 s, the rest being the
 changed text itself. Unchanged next turns are unaffected (2.8-2.9 s). `rocm_tests/stash_ladder_unit.py` checks the
 policy on a mock page table (100K conversation: largest gap 8K instead of 64K).
+
+**No speculative drafts from three jobs on** (`EXL3_MTP_BATCH_MIN=3`, `EXL3_MTP_BATCH_DRAFTS=0`, set in the served
+launcher). With most experts on the CPU every verify row costs expert reads, and different conversations route to
+different experts, so beside other jobs the MTP drafts cost more than they win (Strata decodes its batch slots without
+drafts for the same reason). With three or more decoding jobs a round now decodes one token per job without drafts;
+the MTP layer still writes its K/V for that position from each job's carry state (one batched pass), so a job left alone
+drafts again at once. Through Tabby, 800-token sampled requests, five slots (`rocm_tests/conc_test.py`):
+
+| at once | drafts always (before) | 1 draft from 2 jobs | no drafts from 2 jobs | **no drafts from 3 jobs (served)** |
+|---|---|---|---|---|
+| 1 | code 48-52, prose 38-45 | same | same | same |
+| 2 | 59-61 tok/s total | 62-67 | 57-63 | 60-63 (drafts kept) |
+| 3 | ~64 | | | **74-75** |
+| 5 | 61-62 (13-15 each) | 68-72 | 79-81 | **82-83 (17-18 each)** |
+
+`rocm_tests/mtp_rejoin_api.py` checks the hand-back: a long answer beside a short one, then alone again, decodes as fast
+as the same request alone (257 vs 235 chars/s).
 
 `EXL3_PREFIX_LOG=8192` (served launcher) prints one line per started prompt of at least that many tokens: how far its
 pages match the cache, whether the first miss is changed content or an evicted page, the checkpoints below it and what
@@ -708,6 +726,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_ASYNC_THREAD` | 0 (1 in the served launcher) | run `AsyncGenerator` steps on a worker thread instead of the event loop |
 | `EXL3_STASH_LADDER` | 1 | recurrent checkpoint eviction by replay cost instead of LRU; `_TIP` (4) weights a conversation's latest checkpoint, `_IDLE` (600 s) discounts idle conversations |
 | `EXL3_PREFIX_LOG` | 0 (8192 in the served launcher) | log prefix-cache and checkpoint reuse for prompts of at least N tokens |
+| `EXL3_MTP_BATCH_MIN`, `EXL3_MTP_BATCH_DRAFTS` | 0 (off), 0 (3 and 0 in the served launcher) | with at least MIN decoding jobs, MTP drafts per job (0 = none; the MTP layer still writes its K/V) |
 | `EXL3_KV_STREAM_STATS`, `EXL3_KV_STREAM_VERIFY` | 0, 0 | print slot hit counters every N calls; check every streamed read against the host copy (debug, slow) |
 
 ## Tests and benchmarks (`rocm_tests/`)
@@ -740,6 +759,7 @@ verification from ~45 ms to ~14 ms per round.
 | `kv_stage_bench.py` | staging bandwidth: DMA runs vs the page-gather kernel |
 | `conc_test.py <url> <tag>`, `conc_long.py <url> <tag>` | concurrency through the API: two sampled requests alone and at once (first token, per-request and total tok/s); a short edit arriving during a long prefill and its decode rate while the long prompt is read (needs `max_tokens` honoured) |
 | `cancel_api.py <url>` | client disconnects mid-stream, alone and beside a running request; a later request must complete |
+| `mtp_rejoin_api.py <url> <tag>` | a long answer alone, then beside a short request and alone again: its decode rate after the short one ends (MTP cache consistency after batched rounds) |
 | `prune_api.py <url> <tag>` | a ~100K conversation built over 30 turns, then an early turn rewritten: first-token time of the re-read (checkpoint reuse) |
 | `stash_ladder_unit.py` | recurrent checkpoint retention (ladder vs LRU) on a mock page table, CPU only |
 | `iqbench_data.py`, `iqbench.py <url> <name>` | capability benchmark through an OpenAI endpoint: MMLU-Pro, MATH-500 level 4-5, HumanEval (executed), thinking on, resumable |

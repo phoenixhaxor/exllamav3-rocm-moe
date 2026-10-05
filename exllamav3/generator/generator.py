@@ -27,6 +27,13 @@ _draft_nb_enable = os.environ.get("EXL3_DRAFT_NB", "1") != "0"
 # Decode time granted to decoding jobs after each prefill round that ran beside them, as a fraction of that round's
 # duration (0 = the old schedule: one decode round per prefill round)
 _decode_share = float(os.environ.get("EXL3_DECODE_SHARE", 0.5))
+# MTP drafting beside other jobs: with at least EXL3_MTP_BATCH_MIN decoding jobs (0 = off), a round drafts
+# EXL3_MTP_BATCH_DRAFTS tokens per job instead of num_draft_tokens. 0 = no drafts: the target decodes one token per job
+# and the MTP layer only writes its K/V for that position (from each job's carry state), so a job left alone drafts
+# again at once. With most experts on the CPU every verify row costs expert reads, so batched drafts can cost more
+# than they win
+_mtp_batch_min = int(os.environ.get("EXL3_MTP_BATCH_MIN", 0))
+_mtp_batch_drafts = int(os.environ.get("EXL3_MTP_BATCH_DRAFTS", 0))
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -210,6 +217,7 @@ class Generator:
         self.draft_headroom = max(self.num_draft_tokens, self.mtp_lookup_max)
         self._lookup_round = None
         self._lookup_len = 0
+        self._carry_round = None
         self.lookup_stats = [0, 0, 0]   # rounds, drafted, accepted
         # Self-tuning match threshold: a lookup round that loses more than half its draft raises the
         # suffix length a match needs by 2, a fully accepted one lowers it by 1 (never below mtp_lookup_min).
@@ -636,11 +644,13 @@ class Generator:
             elif self.mtp_draft:
                 for job in self.active_jobs:
                     job.coupled_base = None
+                self._carry_round = None
                 draft_tokens = self.iterate_mtp_lookup() if self.mtp_lookup_min else None
                 if draft_tokens is None:
                     draft_tokens = self.iterate_draftmodel_mtp_gen(results)
                 self.iterate_gen(results, draft_tokens)
                 self._lookup_round = None
+                self._carry_round = None
             else:
                 draft_tokens = self.iterate_draftmodel_gen(results)
                 self.iterate_gen(results, draft_tokens)
@@ -862,14 +872,19 @@ class Generator:
             job_ids = job.get_input_ids_list()
             input_ids_list += job_ids
             mtp_hidden_list.append(job.mtp_last_hidden)
+        temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
+        window = self.num_draft_tokens
+        if _mtp_batch_min and batch_size >= _mtp_batch_min:
+            if _mtp_batch_drafts <= 0:
+                self._carry_round = temp_hidden
+                return None
+            window = min(window, _mtp_batch_drafts)
         batch_ids = self.draft_input_ids_pinned[:batch_size, :]
         batch_ids.copy_(torch.cat(input_ids_list, dim = 0))
-        temp_hidden = torch.cat(mtp_hidden_list, dim = 0)
 
         # Greedy sample batched draft tokens. As in iterate_draftmodel_gen, drafting stops once
         # every row's running product of estimated conditional acceptance probabilities falls
         # below the confidence target, keeping the first low-confidence token as the label probe
-        window = self.num_draft_tokens
         cal = self.draft_calibrator
         conf_cols = []
         reach = None
@@ -1490,6 +1505,21 @@ class Generator:
         if self.mtp_draft:
             target_hidden = p_export_states[-1]
             accepted_idx = 0
+            # A round without drafts (EXL3_MTP_BATCH_DRAFTS=0): the MTP layer never ran, so write its K/V for the one
+            # accepted position of every row, paired with the row's carry state, in one pass
+            carry = self._carry_round
+            if carry is not None and not rewound_jobs:
+                self.draft_model.prefill(
+                    batch_ids[:, :1],
+                    {
+                        "attn_mode": "flash_attn",
+                        "block_table": block_index,
+                        "cache": self.draft_cache,
+                        "cache_seqlens": p_cache_seqlens,
+                        "target_hidden": carry,
+                    },
+                )
+                carry = None
             for job, a_idx, b_idx in zip(self.active_jobs, logit_mapping[:-1], logit_mapping[1:]):
                 if a_idx == b_idx:
                     continue
@@ -1521,6 +1551,19 @@ class Generator:
                                 (self._lookup_round, target_hidden[a_idx:b_idx, :accepted_length - 1, :]),
                                 dim = 1,
                             ),
+                        },
+                    )
+
+                # A round without drafts beside a rewound job: the carry K/V write row by row
+                elif carry is not None:
+                    self.draft_model.prefill(
+                        batch_ids[a_idx:b_idx, :1],
+                        {
+                            "attn_mode": "flash_attn",
+                            "block_table": block_index[a_idx:b_idx],
+                            "cache": self.draft_cache,
+                            "cache_seqlens": p_cache_seqlens[a_idx:b_idx],
+                            "target_hidden": carry[a_idx:b_idx],
                         },
                     )
 
