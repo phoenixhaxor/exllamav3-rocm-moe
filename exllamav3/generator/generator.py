@@ -24,6 +24,9 @@ _mtp_coupled = os.environ.get("EXL3_MTP_COUPLED", "1") != "0"
 _watchdog_s = float(os.environ.get("EXL3_WATCHDOG_S", 300))
 from .adaptive_window import AdaptiveWindow
 _draft_nb_enable = os.environ.get("EXL3_DRAFT_NB", "1") != "0"
+# Decode time granted to decoding jobs after each prefill round that ran beside them, as a fraction of that round's
+# duration (0 = the old schedule: one decode round per prefill round)
+_decode_share = float(os.environ.get("EXL3_DECODE_SHARE", 0.5))
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -219,6 +222,7 @@ class Generator:
         # Chunking/partitioning
         self.max_batch_size = max_batch_size
         self.max_chunk_size = max_chunk_size
+        self._prefill_debt = 0.0
 
         # Job queues
         self.job_serial = 0
@@ -591,12 +595,34 @@ class Generator:
         results = []
         self.iterate_start_jobs(results)
 
-        # Perform one round of prefill
+        # Perform one round of prefill. While other jobs decode, a prefill round (one chunk per job, seconds at a
+        # long context) is followed by decode-only rounds for EXL3_DECODE_SHARE times its duration, so a long
+        # prompt slows the decoding jobs down instead of holding them at one token per chunk. A prompt whose
+        # remainder fits one chunk is read at once, also during those rounds
+        decoding = _decode_share > 0 and any(job.is_prefill_done() for job in self.active_jobs)
+        prefilling = [job for job in self.active_jobs if not job.is_prefill_done()]
+        t_dec = None
+        deferred = ()
+        if decoding and prefilling and self._prefill_debt > 0:
+            t_dec = time.perf_counter()
+            deferred = [job for job in prefilling if job.prefill_remaining() > self.max_chunk_size]
+        t_pf = time.perf_counter()
         for job in list(self.active_jobs):
+            if job in deferred:
+                continue
             try:
                 job.prefill(results)
             except Exception as e:
                 self.reap_failed_job(job, e, results)
+        if decoding and len(prefilling) > len(deferred):
+            cuda_sync_active()
+            dt = time.perf_counter() - t_pf
+            if t_dec is None:
+                self._prefill_debt = dt * _decode_share
+            else:
+                t_dec += dt
+        elif t_dec is None:
+            self._prefill_debt = 0.0
 
         # Recurrent checkpoints
         if self.recurrent_cache is not None:
@@ -631,6 +657,9 @@ class Generator:
         # Visualization
         if self.visualizer:
             self.update_visualizer()
+
+        if t_dec is not None:
+            self._prefill_debt -= time.perf_counter() - t_dec
 
         # Finished iteration
         return results

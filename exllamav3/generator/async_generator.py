@@ -2,7 +2,16 @@ from __future__ import annotations
 from .generator import Generator
 from .job import Job
 import asyncio
+import os
+import collections
+import concurrent.futures
 import torch
+
+# EXL3_ASYNC_THREAD=1: run each generator step on one dedicated worker thread instead of on the event loop. A step can
+# take seconds (a long prompt's chunk), and on the loop it stalls every stream: tokens another job already produced sit
+# in the server's queues until the step ends. Loop-side changes to the sync generator (enqueue, cancel, output
+# constraints) are queued and applied by the worker between steps, so the generator is only ever touched by one thread
+_async_thread = os.environ.get("EXL3_ASYNC_THREAD", "0") != "0"
 
 # Sentinel pushed to an AsyncJob's queue on cancellation so a consumer parked in queue.get() wakes up and
 # exits, rather than waiting forever for results that will no longer be produced
@@ -17,7 +26,24 @@ class AsyncGenerator:
         self.jobs = {}
         self.error = None
         self.condition = asyncio.Condition()
+        self.threaded = _async_thread
+        self._calls = collections.deque()
+        self._executor = concurrent.futures.ThreadPoolExecutor(1, "exl3-generator") if self.threaded else None
         self.iteration_task = asyncio.create_task(self._run_iteration())
+
+    def _call(self, fn):
+        """Apply a change to the sync generator: now, or (threaded) by the worker before its next step"""
+        if self.threaded:
+            self._calls.append(fn)
+        else:
+            fn()
+
+    def _step(self):
+        while self._calls:
+            self._calls.popleft()()
+        if not self.generator.num_remaining_jobs():
+            return []
+        return self.generator.iterate()
 
     async def _run_iteration(self):
         try:
@@ -26,14 +52,18 @@ class AsyncGenerator:
                 # is notified by enqueue() or close(), so this background task does not spin between requests.
                 async with self.condition:
                     # Wake when the first job arrives or when close() has cancelled the iteration task.
-                    await self.condition.wait_for(lambda: len(self.jobs) > 0 or self.iteration_task.cancelled())
+                    await self.condition.wait_for(
+                        lambda: len(self.jobs) > 0 or len(self._calls) > 0 or self.iteration_task.cancelled())
 
                 # Drive exactly one synchronous generator step and fan out any returned events to the owning
                 # AsyncJob queues. Missing jobs can happen if a job was cancelled after iterate() started.
                 # Delivery must never block: this single task serves every job, so waiting on one stalled
                 # consumer (e.g. a disconnected client that stopped draining its queue) would wedge the whole
                 # generator (issue #227).
-                results = self.generator.iterate()
+                if self.threaded:
+                    results = await asyncio.get_running_loop().run_in_executor(self._executor, self._step)
+                else:
+                    results = self.generator.iterate()
                 self.deliver_results(results)
 
                 # Yield back to the event loop so result consumers and cancellation requests can run between
@@ -87,7 +117,7 @@ class AsyncGenerator:
         # land in. The sync generator still owns scheduling and serial assignment.
         assert job.job not in self.jobs
         self.jobs[job.job] = job
-        self.generator.enqueue(job.job)
+        self._call(lambda: self.generator.enqueue(job.job))
 
         # Condition.notify_all() must run while holding the condition lock, so schedule a tiny coroutine instead of
         # trying to notify directly from this synchronous method.
@@ -112,6 +142,9 @@ class AsyncGenerator:
             async_job.put_result(_CANCELLED_SENTINEL)
         self.jobs.clear()
 
+        if self._executor is not None:
+            self._executor.shutdown(wait = True)
+
         cpu_cache = getattr(self.generator, "cpu_page_cache", None)
         if cpu_cache is not None:
             cpu_cache.close()
@@ -124,7 +157,9 @@ class AsyncGenerator:
         # the error; don't poke it from consumers' cleanup handlers, or their except/finally blocks can be hit
         # with a second exception.
         if self.error is None:
-            self.generator.cancel(job.job)
+            self._call(lambda: self.generator.cancel(job.job))
+            if self.threaded:
+                await self._notify_condition()
         if job.job not in self.jobs:
             return
         del self.jobs[job.job]
@@ -174,7 +209,7 @@ class AsyncJob:
         call from any coroutine on the generator's event loop. Note that tokens already sampled by the
         shared iteration task but still queued for this consumer precede the injection in the stream.
         """
-        self.job.constrain_output_now(output)
+        self.generator._call(lambda: self.job.constrain_output_now(output))
 
     async def cancel(self):
         # Delegate cancellation to the wrapper so it can update both the sync generator queue and the async job map,

@@ -202,9 +202,8 @@ slots need no engine change. Measured through TabbyAPI on the 512K profile, samp
 A request alone runs as fast with two slots as with one. Two at once each decode slower than alone, since the
 CPU experts and the attention now serve two sequences per step, but together they deliver ~50% more tokens and
 neither waits for the other. Speculative drafts stay on for both (coupled drafts only apply to a single job). A
-short request that arrives while a long prompt is being read (`rocm_tests/conc_long.py`: a code edit 15 s into a
-126K-token prompt) no longer waits for the whole prefill: the generator interleaves it between the prompt's chunks,
-and both progress.
+short request that arrives while a long prompt is being read is admitted between the prompt's chunks; how fast it then
+decodes is the subject of the next section.
 
 Three slots (`max_batch_size: 3`, 368 CPU experts per layer) load and work, but add no throughput: one request
 alone runs the same (50-52 code / 40-45 prose tok/s), three at once decode at 22-23 tok/s each, 64 tok/s together,
@@ -218,6 +217,45 @@ VRAM, short code edit 66-67 tok/s), but the pinned K/V of 1M tokens (~18 GB with
 of RAM available after load, and starting a ~980K-token request took it under 3 GB within a minute (the test stopped
 the server there, before the kernel's OOM handling could). It needs less RAM per token (a 6-bit KV cache saves ~3.6
 GB at 1M) or more RAM.
+
+### Long prompts, edited history and streaming beside other requests
+
+Three things made several agent sessions on one box slower than the slot count suggests. All three are on by default
+in the served profile; the measurements are the 512K five-slot profile through Tabby.
+
+**Decode between prompt chunks** (`EXL3_DECODE_SHARE`, default 0.5). The generator used to run one prefill chunk
+(8192 tokens, ~6 s at 126K) and then a single decode round for the other jobs, so a request decoding beside a long
+prompt got one round every ~6 s. Now each prefill round that ran beside decoding jobs is followed by decode-only rounds
+for half its duration (as in Strata's `STRATA_BATCH_DECODE_SHARE`); a prompt whose remainder fits one chunk is still
+read at once. `rocm_tests/conc_long.py` (a code edit 15 s into a 126K-token prompt): the edit decodes at 4.1-4.2
+chunks/s while the long prompt is read instead of 0.3, and the long prompt's first token comes at 115-118 s instead of
+94 s.
+
+**Generator steps off the event loop** (`EXL3_ASYNC_THREAD=1`, set in the served launcher). `AsyncGenerator` ran each
+synchronous step on the server's event loop, so during a multi-second prefill step no stream was written: in the test
+above the server produced the edit's first token after 15 s but the client saw it after 44-51 s, and the last token
+~23 s after the server finished. The steps now run on one dedicated worker thread; loop-side changes (enqueue, cancel,
+output constraints) are queued and applied by the worker between steps, so only that thread touches the generator.
+The edit's first token arrives after 17.6 s and the edit completes before the long prompt's first token. Single and
+two-request decode speeds are unchanged (code 41-48, prose 35-41, two at once 59-65 total); clients that disconnect
+mid-stream, alone or beside another request, are cancelled cleanly.
+
+**Recurrent checkpoints over the whole conversation** (`EXL3_STASH_LADDER`, default 1). The hybrid model can only
+resume a cached prefix from a stashed GDN state at or below the first changed token. The stash holds ~18 states
+(`sysmem_recurrent_cache: 2048`, 111 MB each) and was LRU, so a long conversation kept only its latest ~36K tokens of
+checkpoints. Agent clients that prune or rewrite older history then re-read everything: four days of production logs
+had 57 mid-conversation full re-reads of 50-340K-token prompts (71 minutes of prefill, during which the other slots
+slowed down too). The stash now drops the checkpoint whose loss costs the least replay: the gap it leaves on its
+conversation's page chain, a conversation's latest checkpoint counting four times (`EXL3_STASH_LADDER_TIP`), discounted
+by the conversation's idle time (`EXL3_STASH_LADDER_IDLE`, 600 s). A conversation keeps a ladder of checkpoints over its
+whole length. `rocm_tests/prune_api.py` (a 100K conversation built over 30 turns, then turn 3 at ~54K rewritten): LRU
+reused nothing and took 71.8 s to the first token; the ladder resumed from 49,152 and took 39.6 s, the rest being the
+changed text itself. Unchanged next turns are unaffected (2.8-2.9 s). `rocm_tests/stash_ladder_unit.py` checks the
+policy on a mock page table (100K conversation: largest gap 8K instead of 64K).
+
+`EXL3_PREFIX_LOG=8192` (served launcher) prints one line per started prompt of at least that many tokens: how far its
+pages match the cache, whether the first miss is changed content or an evicted page, the checkpoints below it and what
+was reused.
 
 ### Capability: Flash-Next 3.05 bpw vs the dense 27B
 
@@ -666,6 +704,10 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_KV_STREAM` | 0 | 1 = K/V of quantized QSA cache layers in pinned RAM, decode through a VRAM slot cache, prefill through a staged layer image |
 | `EXL3_KV_STREAM_MIN` | 65536 | smallest cache (tokens) that streams |
 | `EXL3_KV_STREAM_SLOTS` | 8192 | VRAM slots per streamed layer (4 tokens each) |
+| `EXL3_DECODE_SHARE` | 0.5 | decode-only time after each prefill round that ran beside decoding jobs, as a fraction of that round (0 = one decode round per prefill round) |
+| `EXL3_ASYNC_THREAD` | 0 (1 in the served launcher) | run `AsyncGenerator` steps on a worker thread instead of the event loop |
+| `EXL3_STASH_LADDER` | 1 | recurrent checkpoint eviction by replay cost instead of LRU; `_TIP` (4) weights a conversation's latest checkpoint, `_IDLE` (600 s) discounts idle conversations |
+| `EXL3_PREFIX_LOG` | 0 (8192 in the served launcher) | log prefix-cache and checkpoint reuse for prompts of at least N tokens |
 | `EXL3_KV_STREAM_STATS`, `EXL3_KV_STREAM_VERIFY` | 0, 0 | print slot hit counters every N calls; check every streamed read against the host copy (debug, slow) |
 
 ## Tests and benchmarks (`rocm_tests/`)
@@ -696,7 +738,10 @@ verification from ~45 ms to ~14 ms per round.
 | `kv_stream_unit.py` | KV streaming kernels vs a torch reference: multi-step selections, eviction pressure, invalidating writes, page copies |
 | `kv_stream_check.py -m <model> --stream 0\|1 [--out F] [--ref F]` | greedy jobs (long prompt, shared prefix, recycled pages) with streaming off / on; with `EXL3_KV_STREAM_VERIFY=1` the bit-exact read check |
 | `kv_stage_bench.py` | staging bandwidth: DMA runs vs the page-gather kernel |
-| `conc_test.py <url> <tag>`, `conc_long.py <url> <tag>` | concurrency through the API: two sampled requests alone and at once (first token, per-request and total tok/s); a short edit arriving during a long prefill (needs `max_tokens` honoured) |
+| `conc_test.py <url> <tag>`, `conc_long.py <url> <tag>` | concurrency through the API: two sampled requests alone and at once (first token, per-request and total tok/s); a short edit arriving during a long prefill and its decode rate while the long prompt is read (needs `max_tokens` honoured) |
+| `cancel_api.py <url>` | client disconnects mid-stream, alone and beside a running request; a later request must complete |
+| `prune_api.py <url> <tag>` | a ~100K conversation built over 30 turns, then an early turn rewritten: first-token time of the re-read (checkpoint reuse) |
+| `stash_ladder_unit.py` | recurrent checkpoint retention (ladder vs LRU) on a mock page table, CPU only |
 | `iqbench_data.py`, `iqbench.py <url> <name>` | capability benchmark through an OpenAI endpoint: MMLU-Pro, MATH-500 level 4-5, HumanEval (executed), thinking on, resumable |
 
 Model paths default to `models/...` or `EXL3_MODEL_DIR` / `EXL3_DRAFT_DIR`. Greedy speculative decoding

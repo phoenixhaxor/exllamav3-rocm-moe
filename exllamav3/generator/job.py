@@ -370,6 +370,10 @@ class Job:
         return all(seq.kv_position == len(seq.sequence_ids) - 1 for seq in self.sequences)
 
 
+    def prefill_remaining(self):
+        return sum(len(seq.sequence_ids) - 1 - seq.kv_position for seq in self.sequences)
+
+
     def get_max_seq_len(self):
         if not self.is_prefill_done():
             return 0

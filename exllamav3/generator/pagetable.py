@@ -19,6 +19,11 @@ from ..cache import RecurrentCache
 from ..tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
 from ..util import profile_opt
 
+# EXL3_PREFIX_LOG=N: one line per started sequence of at least N prompt tokens: how far its page hashes match cache
+# pages (the K/V prefix), whether the first miss is a changed page (a cached sibling under the same parent) or an
+# evicted one, the recurrent checkpoints available below that point, and what was reused
+_prefix_log = int(os.environ.get("EXL3_PREFIX_LOG", 0))
+
 
 def _tensor_blake2b_checksum(tensor: torch.Tensor, prev_hash: bytes | None) -> bytes:
     hasher = hashlib.blake2b(digest_size = 16)
@@ -280,9 +285,16 @@ class Sequence:
             # rewrites those pages anyway
             restore_limit = (max(recurrent_pages) + 1) if recurrent_pages else 0
 
+        diag = None
+        if _prefix_log and len(self.sequence_ids) >= _prefix_log:
+            diag = self.prefix_diag(pagetable, recurrent_cache, page_hashes, recurrent_pages)
+
         # Allocate pages in KV cache, limit prefix caching to available recurrent states
         self.allocated_pages, self.kv_position, cached_pages, non_sequential_pages = \
             pagetable.allocate_pages(page_hashes, new_unique_pages, recurrent_pages, protected_hashes, restore_limit)
+
+        if diag is not None:
+            print(f" -- prefix: prompt {len(self.sequence_ids)}, {diag}, reused {cached_pages * PAGE_SIZE}", flush = True)
 
         # Prepare block index
         self.build_block_index_tensor()
@@ -295,6 +307,30 @@ class Sequence:
                 assert stashed_recurrent_state is not None, "Failed to get cached recurrent state"
 
         return len(self.allocated_pages), cached_pages, non_sequential_pages, stashed_recurrent_state
+
+
+    def prefix_diag(self, pagetable, recurrent_cache, page_hashes, recurrent_pages):
+        tier = pagetable.cpu_tier
+        kv = 0
+        for h in page_hashes:
+            if pagetable.get_live_page(h) is None and (tier is None or h not in tier):
+                break
+            kv += 1
+        miss = "none"
+        if kv < len(page_hashes):
+            parent = page_hashes[kv - 1] if kv else None
+            changed = any(
+                p.kv_position == PAGE_SIZE and p.prev_hash == parent and p.phash != page_hashes[kv]
+                for p in pagetable.all_pages
+            )
+            miss = "changed" if changed else "evicted"
+        rp = recurrent_pages or []
+        below = [pi for pi in rp if pi < kv]
+        best = (max(below) + 1) * PAGE_SIZE if below else 0
+        n_st = len(recurrent_cache) if recurrent_cache is not None else 0
+        mb = recurrent_cache.current_size / 1024**2 if recurrent_cache is not None else 0
+        return (f"kv prefix {kv * PAGE_SIZE} (miss: {miss}), checkpoints on prompt "
+                f"{[(pi + 1) * PAGE_SIZE for pi in rp][-6:]}, best {best}, stash {n_st} = {mb:.0f} MB")
 
 
 class PageTable:

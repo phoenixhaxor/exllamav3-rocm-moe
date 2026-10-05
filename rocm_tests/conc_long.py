@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Long + short at once: a ~150K-token prompt starts, a short code edit arrives 15 s later. Reports first-token time
-# and decode rate of each (streamed), so the short request's wait behind the long prefill is visible.
+# and decode rate of each (streamed), so the short request's wait behind the long prefill is visible, and how many
+# tokens the short one decoded while the long prompt was still being read (EXL3_DECODE_SHARE).
 import json, os, sys, threading, time, urllib.request, glob
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 URL = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8098"
@@ -24,7 +25,7 @@ def run(name, t_start):
     body = {"model": "x", "messages": [{"role": "user", "content": prompt}], "max_tokens": n, "stream": True,
             "stream_options": {"include_usage": True}, "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(URL + "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
-    t0 = time.time(); tf = None; usage = None
+    t0 = time.time(); tf = None; usage = None; stamps = out.setdefault(name + "_t", [])
     with urllib.request.urlopen(req, timeout = 3600) as r:
         for line in r:
             line = line.decode().strip()
@@ -33,12 +34,21 @@ def run(name, t_start):
             if d.get("usage"): usage = d["usage"]
             for c in d.get("choices", []):
                 dl = c.get("delta", {})
-                if (dl.get("content") or dl.get("reasoning_content")) and tf is None: tf = time.time()
+                if dl.get("content") or dl.get("reasoning_content"):
+                    stamps.append(time.time())
+                    if tf is None: tf = time.time()
     t1 = time.time()
     toks = usage["completion_tokens"]; pt = usage["prompt_tokens"]
+    out[name + "_first"] = tf
     out[name] = f"{name}: prompt {pt}, sent at +{t0 - t_start:.0f}s, first token after {tf - t0:.1f}s, {toks} tok at {toks / (t1 - tf):.1f} tok/s, done at +{t1 - t_start:.0f}s"
 t_start = time.time()
 th = [threading.Thread(target = run, args = (k, t_start)) for k in reqs]
 for t in th: t.start()
 for t in th: t.join()
 for k in reqs: print(TAG, out[k], flush = True)
+lf = out["long_first"]; st = [t for t in out["short_t"] if t < lf]
+if len(st) > 1:
+    print(TAG, f"short during the long prefill: {len(st)} chunks in {st[-1] - st[0]:.1f}s = "
+          f"{(len(st) - 1) / (st[-1] - st[0]):.1f} chunks/s", flush = True)
+else:
+    print(TAG, f"short during the long prefill: {len(st)} chunks", flush = True)
