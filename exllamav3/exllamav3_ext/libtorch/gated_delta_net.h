@@ -335,6 +335,7 @@ struct BC_GatedDeltaNetSplit
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
         bool history,
+        const c10::optional<at::Tensor>& replay,
         Slot& s,
         Graph* graph
     );
@@ -346,7 +347,8 @@ struct BC_GatedDeltaNetSplit
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
-        bool history
+        bool history,
+        const c10::optional<at::Tensor>& replay
     );
 };
 

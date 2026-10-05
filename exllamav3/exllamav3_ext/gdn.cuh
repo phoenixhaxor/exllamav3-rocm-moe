@@ -45,7 +45,8 @@ void cuda_recurrent_gated_delta_rule
     int k_head_dim,
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
-    bool history
+    bool history,
+    const c10::optional<at::Tensor>& replay
 );
 
 void cuda_recurrent_gated_delta_rule_gr
@@ -61,6 +62,7 @@ void cuda_recurrent_gated_delta_rule_gr
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
+    const c10::optional<at::Tensor>& replay,
     Graph* graph
 );
 
@@ -246,8 +248,25 @@ struct StateRewindJob
         src(_src), dst(_dst), num_elements(_num_elements) {}
 };
 
+// Replay rewind (EXL3_GDN_REPLAY): state points at recurrent_state[slot, 0] (the snapshot is the next state), replay
+// at the slot's first replay row; the state becomes the snapshot advanced through `accepted` tokens
+struct StateReplayJob
+{
+    uintptr_t state;
+    uintptr_t replay;
+    int accepted;
+    int num_k_heads;
+    int num_v_heads;
+    int tok_bytes;
+
+    StateReplayJob() = default;
+    StateReplayJob(uintptr_t _state, uintptr_t _replay, int _accepted, int _nk, int _nv, int _tok_bytes) :
+        state(_state), replay(_replay), accepted(_accepted), num_k_heads(_nk), num_v_heads(_nv), tok_bytes(_tok_bytes) {}
+};
+
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
 void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_index);
+void batched_state_replay(std::vector<StateReplayJob> const& jobs, int device_index);
 
 bool gdn_core_mk
 (
@@ -271,6 +290,7 @@ bool gdn_core_mk
     int k_head_dim,
     int v_head_dim,
     bool history,
+    const c10::optional<at::Tensor>& replay,
     const c10::optional<at::Tensor>& o_suh,
     const c10::optional<at::Tensor>& gn_w,
     const c10::optional<at::Tensor>& gn_g,

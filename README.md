@@ -179,10 +179,11 @@ streaming costs ~3% of decode speed at short contexts (the resolve and copy laun
 than repay it. The RAM side: the K/V take ~9 GB of pinned RAM at 512K, and the experts that move to the GPU free ~8 GB,
 so ~1.5 GB less is available. Without the variable, nothing changes.
 
-**Served profile since 2026-10-05:** 512K (YaRN x2), `EXL3_KV_STREAM=1`, `cpu_moe_split_experts: 380`,
-`max_batch_size: 5` (up to five requests decode together; each slot beyond the first needs ~6 more CPU experts per
-layer). The 400K needle run on this exact setting: 3/3, prefill 350 s (1,140 tok/s), decode at that context
-42 / 33 tok/s, short code edit 66 tok/s, ~9.4 GB of RAM still available afterwards.
+**Served profile since 2026-10-05:** 512K (YaRN x2), `EXL3_KV_STREAM=1`, `max_batch_size: 5` (up to five requests
+decode together), `cpu_moe_split_experts: 362` with `EXL3_GDN_REPLAY=1` (380 before it: each slot beyond the first
+needed ~6 more CPU experts per layer, ~2 with replay), plus the concurrency switches below. The 400K needle run with
+replay: 3/3, decode at that context 45 / 34 tok/s; at 380 without replay, prefill 350 s (1,140 tok/s) and ~9.4 GB of
+RAM still available afterwards.
 
 ### Several requests at once (`max_batch_size: 2`)
 
@@ -285,6 +286,27 @@ threshold as the single-job lookup. `rocm_tests/conc_edit_api.py` (each request 
 | 2 edits at once | 66-77 tok/s total | 71-83 |
 | 3 edits at once | 70 (24 each) | **100 (35-38 each)** |
 | free text, 2 / 5 at once | 57-62 / 81-82 | 57-63 / 80 |
+
+**GDN rewind by replay** (`EXL3_GDN_REPLAY=1`, served launcher). Each cache slot cost ~566 MB of VRAM, almost all of it
+GDN recurrent state: fp32 [slots, max_history + 1, 48, 128, 128] per layer over 36 layers, where the four history
+states (max_history 4, for prompt-lookup windows) only exist to rewind rejected draft tokens. With replay a slot keeps
+two states: the current one and the state the verify pass started from. The verify pass stores each token's
+recurrence inputs instead (normalized k, raw v, decay and beta, ~20 KB per token and layer), and a rewind re-runs the
+accepted tokens from the snapshot in one batched launch (`batched_state_replay`) with the recurrence kernels' exact
+arithmetic, so the rewound state is bit-identical to the stored one (`rocm_tests/gdn_replay_unit.py`: every accepted
+count, bsz 1 register kernel and bsz 3 128-column kernel, permuted slots). The register kernel, the 128-column kernel
+and the bsz-1 megakernel all take the replay buffer; graph capture is skipped for a replay pass.
+
+That frees ~340 MB per slot, 1.7 GB at five slots, and the five-slot 512K profile now loads at 362 CPU experts per
+layer instead of 380 (400K needles 3/3, no OOM):
+
+| five slots, 512K | 380, history (before) | **362, replay (served)** |
+|---|---|---|
+| code alone | 45-48 tok/s | 50-52 |
+| prose / other alone | 36-45 | 36-47 |
+| code edit alone | 66-97 | 88-93 |
+| three edits at once, each | 35-38 | 37-40 |
+| five at once, total (each) | 82-83 (17-18) | 86-88 (18-19) |
 
 `EXL3_PREFIX_LOG=8192` (served launcher) prints one line per started prompt of at least that many tokens: how far its
 pages match the cache, whether the first miss is changed content or an evicted page, the checkpoints below it and what
@@ -743,6 +765,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_PREFIX_LOG` | 0 (8192 in the served launcher) | log prefix-cache and checkpoint reuse for prompts of at least N tokens |
 | `EXL3_MTP_BATCH_MIN`, `EXL3_MTP_BATCH_DRAFTS` | 0 (off), 0 (3 and 0 in the served launcher) | with at least MIN decoding jobs, MTP drafts per job (0 = none; the MTP layer still writes its K/V) |
 | `EXL3_MTP_LOOKUP_BATCH` | 0 (1 in the served launcher) | prompt lookup for jobs in a batch, in place of their MTP draft, when it pays for the padding |
+| `EXL3_GDN_REPLAY` | 0 (1 in the served launcher) | GDN rewind by replay: 2 recurrent states per slot instead of max_history + 1 |
 | `EXL3_KV_STREAM_STATS`, `EXL3_KV_STREAM_VERIFY` | 0, 0 | print slot hit counters every N calls; check every streamed read against the host copy (debug, slow) |
 
 ## Tests and benchmarks (`rocm_tests/`)
@@ -770,6 +793,7 @@ verification from ~45 ms to ~14 ms per round.
 | `kprof_prefill.py -m <model> [--chunk N]` | kernel and aten-op profile (with shapes) of one prefill chunk |
 | `prefill_bench.py -m <model> [--chunk N] [--mtp] [--warm]` | prefill tok/s through the Generator on fresh prompts, with n-gram prefetch hit counts |
 | `dist_check.py -m <model>` | token-distribution check of coupled vs uncoupled speculative sampling |
+| `gdn_replay_unit.py` | GDN replay rewind vs stored history, bit-exact, at the kernel level |
 | `kv_stream_unit.py` | KV streaming kernels vs a torch reference: multi-step selections, eviction pressure, invalidating writes, page copies |
 | `kv_stream_check.py -m <model> --stream 0\|1 [--out F] [--ref F]` | greedy jobs (long prompt, shared prefix, recycled pages) with streaming off / on; with `EXL3_KV_STREAM_VERIFY=1` the bit-exact read check |
 | `kv_stage_bench.py` | staging bandwidth: DMA runs vs the page-gather kernel |

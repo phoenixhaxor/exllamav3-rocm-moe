@@ -56,7 +56,8 @@ void BC_GatedDeltaNet::run_bsz1_b
         k_head_dim,
         v_head_dim,
         c10::nullopt,
-        false
+        false,
+        c10::nullopt
     );
 
     norm->run(core_attn_out, core_attn_out_f, z);
@@ -228,6 +229,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
     bool history,
+    const c10::optional<at::Tensor>& replay,
     Slot& s,
     Graph* graph
 )
@@ -291,7 +293,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         (
             x, ba_weight_t, ba_bias, s.ba, s.qkv, conv_state, slots, conv1d_weight, conv1d_bias, s.conv_out,
             dt_bias, a_log, beta_scale, recurrent_state, s.core_attn_out,
-            num_k_heads, num_v_heads, k_head_dim, v_head_dim, history,
+            num_k_heads, num_v_heads, k_head_dim, v_head_dim, history, replay,
             gnorm_path ? c10::optional<at::Tensor>(o_proj->suh) : c10::nullopt,
             gnorm_path ? c10::optional<at::Tensor>(norm->weight) : c10::nullopt,
             gnorm_path ? c10::optional<at::Tensor>(s.z) : c10::nullopt,
@@ -341,6 +343,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
             v_head_dim,
             slots,
             history,
+            replay,
             graph
         );
     }
@@ -365,7 +368,8 @@ void BC_GatedDeltaNetSplit::run_bszN
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
-    bool history
+    bool history,
+    const c10::optional<at::Tensor>& replay
 )
 {
     py::gil_scoped_release release;
@@ -379,10 +383,11 @@ void BC_GatedDeltaNetSplit::run_bszN
     Slot& s = slot(bsz, seqlen, history);
     TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN: slot not configured");
 
+    // A replay pass writes the replay rows through a pointer a graph would bake in: run it eagerly
     static const bool nograph = graph_disabled_for("gdn");
-    if (nograph || s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
+    if (nograph || (history && replay.has_value()) || s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, replay, s, nullptr);
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
@@ -395,14 +400,14 @@ void BC_GatedDeltaNetSplit::run_bszN
     if ((int) conv_state.size(2) != s.graph_state_size ||
         (int) recurrent_state.size(1) != s.graph_hist_stride)
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, c10::nullopt, s, nullptr);
         return;
     }
 
     if (!s.graph->ready)
     {
         s.graph->capture_begin();
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, s.graph.get());
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, c10::nullopt, s, s.graph.get());
         s.graph->capture_end();
     }
 

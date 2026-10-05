@@ -19,6 +19,10 @@ _qkv_slice_enable = os.environ.get("EXL3_QKV_SLICE", "1") != "0"
 # EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
 _bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
 _rewind_cache_enable = os.environ.get("EXL3_REWIND_CACHE", "1") != "0"
+# EXL3_GDN_REPLAY=1: a GDN layer (128x128 heads, per-head decay) keeps 2 recurrent states per cache slot instead of
+# max_history + 1. A speculative verify pass stores the state it starts from and each token's recurrence inputs; a
+# rewind re-runs the accepted tokens from there (gdn.cu, GdnReplay). Saves (max_history - 1) states per slot and layer
+_gdn_replay = os.environ.get("EXL3_GDN_REPLAY", "0") != "0"
 from ..model.model_tp_shared import TPTensorWrapper
 import os as _os
 _conv_cl = _os.environ.get("EXL3_GDN_CONV_CL", "1") != "0"
@@ -47,13 +51,13 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
             # torch.device, so normalize rather than assume a .index attribute
             device_index = torch.device(l.device).index
-            conv_jobs, state_jobs = jobs_by_device.setdefault(device_index, ([], []))
+            conv_jobs, state_jobs, replay_jobs = jobs_by_device.setdefault(device_index, ([], [], []))
             cj = l.rewind_conv_job(slot, last_history, num_tokens)
             if cj is not None:
                 conv_jobs.append(cj)
             sj = l.rewind_state_job(slot, last_history, num_tokens)
             if sj is not None:
-                state_jobs.append(sj)
+                (replay_jobs if l.replay is not None else state_jobs).append(sj)
         else:
             l.rewind(slot, last_history, num_tokens)
     return jobs_by_device
@@ -84,11 +88,13 @@ def _cached_rewind_jobs(cache, layers: dict, slot: int, last_history: int, num_t
 
 
 def _dispatch_rewind_jobs(jobs_by_device):
-    for device_index, (conv_jobs, state_jobs) in jobs_by_device.items():
+    for device_index, (conv_jobs, state_jobs, replay_jobs) in jobs_by_device.items():
         if conv_jobs:
             ext.batched_conv_rewind(conv_jobs, device_index)
         if state_jobs:
             ext.batched_state_rewind(state_jobs, device_index)
+        if replay_jobs:
+            ext.batched_state_replay(replay_jobs, device_index)
 
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
@@ -216,11 +222,28 @@ class GDNLayerState:
             dtype = torch.bfloat16,
             device = "meta"
         )
+        # Replay rewind (EXL3_GDN_REPLAY): the current state and the verify pass's starting state per slot, plus
+        # per-token recurrence input rows (k f32, v bf16, decay and beta f32 per head)
+        replay = (
+            _gdn_replay and max_history > 0 and type(module).__name__ == "GatedDeltaNet" and
+            not getattr(module, "kda", False) and module.k_head_dim == 128 and module.v_head_dim == 128 and
+            module.num_v_heads <= 64
+        )
         self.recurrent_state = torch.empty(
-            (max_batch_size, max_history + 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
+            (max_batch_size, 2 if replay else max_history + 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
             dtype = torch.float,
             device = "meta"
         )
+        if replay:
+            self.replay_tok_bytes = module.num_k_heads * 128 * 4 + module.num_v_heads * 128 * 2 + module.num_v_heads * 8
+            self.replay = torch.empty(
+                (max_batch_size, max_history + 1, self.replay_tok_bytes),
+                dtype = torch.uint8,
+                device = "meta"
+            )
+        else:
+            self.replay_tok_bytes = 0
+            self.replay = None
         self.device = None
         self.max_history = max_history
         self.max_batch_size = max_batch_size
@@ -235,7 +258,8 @@ class GDNLayerState:
 
 
     def storage_size(self):
-        return sum(t.numel() * t.element_size() for t in [self.conv_state, self.recurrent_state])
+        ts = [self.conv_state, self.recurrent_state] + ([self.replay] if self.replay is not None else [])
+        return sum(t.numel() * t.element_size() for t in ts)
 
 
     def alloc(self, device):
@@ -243,12 +267,16 @@ class GDNLayerState:
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = device)
         self.conv_state.zero_()
         self.recurrent_state.zero_()
+        if self.replay is not None:
+            self.replay = torch.zeros_like(self.replay, device = device)
         self.device = device
 
 
     def free(self):
         self.conv_state = torch.empty_like(self.conv_state, device = "meta")
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = "meta")
+        if self.replay is not None:
+            self.replay = torch.empty_like(self.replay, device = "meta")
         self.device = None
 
 
@@ -267,7 +295,12 @@ class GDNLayerState:
 
     def rewind(self, slot: int, last_history: int, num_tokens: int):
         assert num_tokens <= last_history
-        if num_tokens > 0:
+        if num_tokens > 0 and self.replay is not None:
+            ext.batched_state_replay(
+                [self.rewind_state_job(slot, last_history, num_tokens)],
+                torch.device(self.device).index
+            )
+        elif num_tokens > 0:
             r_state = self.recurrent_state[slot, 0]
             r_state_rewind = self.recurrent_state[slot, last_history + 1 - num_tokens]
             r_state.copy_(r_state_rewind)
@@ -310,6 +343,17 @@ class GDNLayerState:
         rs = self.recurrent_state
         es = rs.element_size()
         base = rs.data_ptr() + slot * rs.stride(0) * es
+        if self.replay is not None:
+            # Replay the accepted tokens (last_history + 1 - num_tokens of the pass) from the snapshot
+            m = self.module
+            return ext.StateReplayJob(
+                base,
+                self.replay.data_ptr() + slot * self.replay.stride(0),
+                last_history + 1 - num_tokens,
+                m.num_k_heads,
+                m.num_v_heads,
+                self.replay_tok_bytes,
+            )
         return ext.StateRewindJob(
             base + (last_history + 1 - num_tokens) * rs.stride(1) * es,
             base,
@@ -1057,10 +1101,12 @@ class GatedDeltaNet(Module):
             else:
                 rsl = rsg[0].cache.get_recurrent_layer(layer_instance)
             conv_state, recurrent_state = rsl.get_state_tensors()
+            replay = getattr(rsl, "replay", None) if save_history else None
             save_state = True
         else:
             recurrent_slots = None
             conv_state, recurrent_state = None, None
+            replay = None
             save_state = False
             save_history = False  # no SD without prior state, for simplicity
 
@@ -1102,7 +1148,7 @@ class GatedDeltaNet(Module):
                 else:
                     self._bc_configure_slot(bsz, seqlen, save_history)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
-            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
+            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history, replay)
             if self.tp_reduce:
                 self.tp_collect(params["backend"], y)
             return to2(y, out_dtype, self.out_dtype)
@@ -1201,6 +1247,7 @@ class GatedDeltaNet(Module):
             recurrent_slots = recurrent_slots,
             history = save_history,
             save_state = save_state,
+            replay = replay,
             num_k_heads = self.num_k_heads,
             num_v_heads = self.num_v_heads,
             k_dim = self.k_dim,

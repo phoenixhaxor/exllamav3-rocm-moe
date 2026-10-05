@@ -259,6 +259,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def(py::init<uintptr_t, uintptr_t, int64_t>());
     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
     m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
+    py::class_<StateReplayJob>(m, "StateReplayJob")
+        .def(py::init<uintptr_t, uintptr_t, int, int, int, int>());
+    m.def("batched_state_replay", &batched_state_replay, py::arg("jobs"), py::arg("device_index"));
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");

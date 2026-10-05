@@ -450,6 +450,44 @@ void mamba2_dt_op
 // delta-correction readback: no q/k L2 norm, v used raw (beta = dt scales it in the update),
 // output y = q.S + D*v with no 1/sqrt(dk) scale. Input layout is the conv channel order
 // [x (v_dim), B (k_dim), C (k_dim)] with x->v, B->k, C->q
+// Replay rewind (EXL3_GDN_REPLAY): with a history pass and a replay buffer, the 128x128 GDN recurrence kernels keep
+// no per-token states. They write the state they start from to recurrent_state[slot, 1] (the snapshot) and each
+// token's recurrence inputs to the slot's replay rows: the normalized k of every k head (fp32), the raw v (bf16) and
+// the per-head decay and beta (fp32), exactly as the kernel used them. The final state goes to [slot, 0] as without
+// history. A rewind then re-runs the accepted tokens from the snapshot (batched_state_replay_kernel) with the same
+// arithmetic, instead of copying one of max_history stored states; the state buffer holds 2 states per slot instead
+// of max_history + 1. Row layout per token: k [num_k_heads * 128] f32, v [num_v_heads * 128] bf16, then g and beta
+// [num_v_heads] f32 each.
+struct GdnReplay
+{
+    char* buf;                      // [num_slots, tokens, tok_bytes], null: no replay
+    int tokens;
+    int tok_bytes;
+};
+
+__device__ __forceinline__ char* gdn_replay_row(const GdnReplay& r, int slot, int s)
+{
+    return r.buf + ((size_t) slot * r.tokens + s) * r.tok_bytes;
+}
+
+// One token's recurrence inputs from a 128-thread (4 warps x 32 columns) recurrence block, as it used them
+__device__ __forceinline__ void gdn_replay_store
+(
+    const GdnReplay& r, int slot, int s, int num_k_heads, int num_v_heads, int head, int k_head, int group,
+    int v_start, int tid, int bt, int t, const float* sh_k, const bfloat16* gl_v, float g_h, float beta_h
+)
+{
+    char* row = gdn_replay_row(r, slot, s);
+    if (head % group == 0 && v_start == 0) ((float*) row)[k_head * 128 + tid] = sh_k[tid];
+    if (bt == 0) ((bfloat16*) (row + num_k_heads * 128 * 4))[head * 128 + v_start + t] = gl_v[t];
+    if (tid == 0)
+    {
+        float* rg = (float*) (row + num_k_heads * 128 * 4 + num_v_heads * 128 * 2);
+        rg[head] = g_h;
+        rg[num_v_heads + head] = beta_h;
+    }
+}
+
 template <int MAX_HEAD_DIM, bool save_history, int V_SPLIT, bool MAMBA2 = false>
 __global__ __launch_bounds__(MAX_HEAD_DIM * SUBK)
 void cuda_recurrent_gated_delta_rule_kernel
@@ -470,7 +508,8 @@ void cuda_recurrent_gated_delta_rule_kernel
     const float scale,
     const int* __restrict__ slots,              // [bsz]
     const int history_stride,                   // max_history + 1
-    const float* __restrict__ D                 // [num_v_heads], MAMBA2 only, else nullptr
+    const float* __restrict__ D,                // [num_v_heads], MAMBA2 only, else nullptr
+    const GdnReplay replay                      // unsupported here (buf null)
 )
 {
     int group = num_v_heads / num_k_heads;
@@ -704,8 +743,9 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     const int v_head_dim,
     const float scale,
     const int* __restrict__ slots,              // [bsz]
-    const int history_stride,                   // max_history + 1
-    const float* __restrict__ D                 // unused, matches the generic kernel signature
+    const int history_stride,                   // max_history + 1, or 2 with replay
+    const float* __restrict__ D,                // unused, matches the generic kernel signature
+    const GdnReplay replay                      // replay rewind (history pass, per-head decay)
 )
 {
     constexpr int HEAD_DIM = 128;
@@ -752,7 +792,13 @@ void cuda_recurrent_gated_delta_rule_kernel_128
 
         float* gl_rs_r;
         float* gl_rs_w;
-        if constexpr (save_history)
+        const bool rp = save_history && !CHANNELWISE && replay.buf != nullptr;
+        if (rp)
+        {
+            gl_rs_r = final_state + head * HEAD_STATE_SIZE;
+            gl_rs_w = gl_rs_r;
+        }
+        else if constexpr (save_history)
         {
             bool first = (s == 0);
             bool last = (s == seqlen - 1);
@@ -802,6 +848,14 @@ void cuda_recurrent_gated_delta_rule_kernel_128
         if constexpr (CHANNELWISE)
             sh_g[t] = __expf(g[head * HEAD_DIM + t]);
 
+        if (rp && bt == 0)
+        {
+            char* row = gdn_replay_row(replay, state_slot, s);
+            if (head % group == 0 && v_chunk == 0) ((float*) row)[k_head * HEAD_DIM + t] = k;
+            if (t < V_CHUNK_DIM)
+                ((bfloat16*) (row + num_k_heads * HEAD_DIM * 4))[head * HEAD_DIM + v_start + t] = gl_v[t];
+        }
+
         __syncthreads();
 
         if (t < V_CHUNK_DIM)
@@ -843,6 +897,14 @@ void cuda_recurrent_gated_delta_rule_kernel_128
             float* sh_q_rd = sh_q + bt * BTS;
             float* rs_r = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
             float* rs_w = gl_rs_w + v_start + t + bt * BTS * HEAD_DIM;
+            // Replay: the state this pass starts from is the snapshot, [slot, 1]
+            float* rs_snap = (rp && s == 0) ? rs_r + state_size : nullptr;
+            if (rp && bt == 0 && t == 0)
+            {
+                float* rg = (float*) (gdn_replay_row(replay, state_slot, s) + num_k_heads * HEAD_DIM * 4 + num_v_heads * HEAD_DIM * 2);
+                rg[head] = g_h;
+                rg[num_v_heads + head] = beta_h;
+            }
 
             #pragma unroll
             for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
@@ -851,6 +913,7 @@ void cuda_recurrent_gated_delta_rule_kernel_128
                 for (int j = 0; j < 8; ++j, rs_r += HEAD_DIM, rs_w += HEAD_DIM, sh_k_rd++, sh_g_rd++, sh_q_rd++)
                 {
                     float state = *rs_r;
+                    if (rs_snap) { *rs_snap = state; rs_snap += HEAD_DIM; }
                     state = state * (CHANNELWISE ? *sh_g_rd : g_h) + *sh_k_rd * v * beta_h;
                     *rs_w = state;
                     v_out = v_out + *sh_q_rd * state;
@@ -903,7 +966,8 @@ void cuda_recurrent_gated_delta_rule_kernel_128_reg
     const float scale,
     const int* __restrict__ slots,
     const int history_stride,
-    const float* __restrict__ D
+    const float* __restrict__ D,
+    const GdnReplay replay
 )
 {
     constexpr int HEAD_DIM = 128;
@@ -943,6 +1007,12 @@ void cuda_recurrent_gated_delta_rule_kernel_128_reg
     float st[BTS];
     #pragma unroll
     for (int i = 0; i < BTS; ++i) st[i] = slot_state[col_off + (size_t) i * HEAD_DIM];
+    const bool rp = save_history && replay.buf != nullptr;
+    if (rp)
+    {
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i) slot_state[state_size + col_off + (size_t) i * HEAD_DIM] = st[i];
+    }
 
     for (int s = 0; s < seqlen; ++s)
     {
@@ -989,20 +1059,23 @@ void cuda_recurrent_gated_delta_rule_kernel_128_reg
 
         const float g_h = __expf(g[head]);
         const float beta_h = __bfloat162float(beta[head]);
+        if (rp) gdn_replay_store(replay, state_slot, s, num_k_heads, num_v_heads, head, k_head, group, v_start, tid, bt, t,
+                                 sh_k, gl_v, g_h, beta_h);
         float dot1 = 0.0f;
         #pragma unroll
         for (int j = 0; j < NSUB; ++j) dot1 += sh_dot1[j][t];
         const float v = __bfloat162float(gl_v[t]) - dot1 * g_h;
         float v_out = 0.0f;
         const bool last = s == seqlen - 1;
-        float* hw = slot_state + (save_history && !last ? (size_t) (s + 1) * state_size : 0) + col_off;
+        const bool hist = save_history && !rp;
+        float* hw = slot_state + (hist && !last ? (size_t) (s + 1) * state_size : 0) + col_off;
         #pragma unroll
         for (int i = 0; i < BTS; ++i)
         {
             float state = st[i];
             state = state * g_h + sk[i] * v * beta_h;
             st[i] = state;
-            if (save_history || last) hw[(size_t) i * HEAD_DIM] = state;
+            if (hist || last) hw[(size_t) i * HEAD_DIM] = state;
             v_out = v_out + sq[i] * state;
         }
         sh_dot2[bt][t] = v_out;
@@ -1036,12 +1109,14 @@ void cuda_recurrent_gated_delta_rule_gr
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
+    const c10::optional<at::Tensor>& replay,
     Graph* graph
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(mixed_qkv.device());
     cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(!graph || slots.has_value(), "cuda_recurrent_gated_delta_rule: graph capture requires slots");
+    const bool use_replay = history && replay.has_value();
 
     int bsz = mixed_qkv.size(0);
     int seqlen = mixed_qkv.size(1);
@@ -1071,11 +1146,21 @@ void cuda_recurrent_gated_delta_rule_gr
                 "beta must be [bsz, seqlen, num_v_heads]");
     TORCH_CHECK(recurrent_state.dim() == 5 &&
                 recurrent_state.size(0) >= (slots.has_value() ? 1 : bsz) &&
-                recurrent_state.size(1) >= (history ? seqlen : 1) &&
+                recurrent_state.size(1) >= (use_replay ? 2 : history ? seqlen : 1) &&
                 recurrent_state.size(2) == num_v_heads &&
                 recurrent_state.size(3) == k_head_dim &&
                 recurrent_state.size(4) == v_head_dim,
                 "recurrent_state must be [num_slots, max_history + 1, num_v_heads, k_head_dim, v_head_dim]");
+    GdnReplay rp = { nullptr, 0, 0 };
+    if (use_replay)
+    {
+        TORCH_CHECK(k_head_dim == 128 && v_head_dim == 128 && !channelwise, "replay rewind: 128x128 heads, per-head decay only");
+        TORCH_CHECK(replay->dim() == 3 && replay->size(0) == recurrent_state.size(0) && replay->size(1) >= seqlen &&
+                    replay->size(2) == num_k_heads * 128 * 4 + num_v_heads * 128 * 2 + num_v_heads * 8 &&
+                    replay->dtype() == at::kByte && replay->is_contiguous(),
+                    "replay must be uint8 [num_slots, >= seqlen, row bytes]");
+        rp = { (char*) replay->data_ptr(), (int) replay->size(1), (int) replay->size(2) };
+    }
     TORCH_CHECK(core_attn_out.dim() == 4 &&
                 core_attn_out.size(0) == bsz &&
                 core_attn_out.size(1) == seqlen &&
@@ -1124,7 +1209,8 @@ void cuda_recurrent_gated_delta_rule_gr
         scale,                                  \
         slots_ptr,                              \
         history_stride,                         \
-        nullptr
+        nullptr,                                \
+        rp
 
     // recurrent_state is kernel param 3 and slots is param 12, patched when running in a graph
     #define LAUNCH_RULE(...)                                                              \
@@ -1208,12 +1294,13 @@ void cuda_recurrent_gated_delta_rule
     int k_head_dim,
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
-    bool history
+    bool history,
+    const c10::optional<at::Tensor>& replay
 )
 {
     cuda_recurrent_gated_delta_rule_gr(
         mixed_qkv, g, beta, recurrent_state, core_attn_out,
-        num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, nullptr);
+        num_k_heads, num_v_heads, k_head_dim, v_head_dim, slots, history, replay, nullptr);
 }
 
 // Mamba2 decode helper for the BC graph: reads the in_proj output [z, xBC, dt] (float, row
@@ -1435,7 +1522,8 @@ void cuda_recurrent_mamba2_gr
         scale,                                  \
         slots_ptr,                              \
         history_stride,                         \
-        (const float*) D.data_ptr()
+        (const float*) D.data_ptr(),            \
+        GdnReplay { nullptr, 0, 0 }
 
     // recurrent_state is kernel param 3 and slots is param 12, patched when running in a graph
     #define LAUNCH_RULE(...)                                                              \
@@ -2213,6 +2301,108 @@ void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_in
     }
 }
 
+// Replay rewind: recurrent_state[slot, 0] <- the snapshot [slot, 1] advanced through the first `accepted` tokens of
+// the slot's replay rows (see GdnReplay), with the arithmetic of the recurrence kernels' state update (same per-thread
+// row order, same k-slice reduction order). One block per (job, v head, 32-column chunk), 128 threads.
+#define REPLAY_MAX_HEADS 64
+
+struct StateReplayJobBatch { StateReplayJob jobs[REWIND_MAX_JOBS]; int num_jobs; };
+
+__global__ __launch_bounds__(128)
+void batched_state_replay_kernel(StateReplayJobBatch batch)
+{
+    constexpr int HEAD_DIM = 128;
+    constexpr int NSUB = 4;
+    constexpr int BTS = HEAD_DIM / NSUB;
+    constexpr size_t HEAD_STATE_SIZE = HEAD_DIM * HEAD_DIM;
+
+    const int job_idx = blockIdx.y;
+    if (job_idx >= batch.num_jobs) return;
+    const StateReplayJob j = batch.jobs[job_idx];
+    const int nk = j.num_k_heads;
+    const int nv = j.num_v_heads;
+    if ((int) blockIdx.x >= nv * 4) return;
+
+    const int head = blockIdx.x / 4;
+    const int v_start = (blockIdx.x % 4) * 32;
+    const int group = nv / nk;
+    const int k_head = head / group;
+    const size_t state_size = (size_t) nv * HEAD_STATE_SIZE;
+
+    const int tid = threadIdx.x;
+    const int t = tid & 31;
+    const int bt = tid >> 5;
+
+    float* cur = (float*) j.state;
+    const float* snap = cur + state_size;
+
+    __shared__ float sh_k[HEAD_DIM];
+    __shared__ float sh_dot1[NSUB][32];
+
+    const size_t col_off = (size_t) head * HEAD_STATE_SIZE + v_start + t + (size_t) bt * BTS * HEAD_DIM;
+    float st[BTS];
+    #pragma unroll
+    for (int i = 0; i < BTS; ++i) st[i] = snap[col_off + (size_t) i * HEAD_DIM];
+
+    for (int s = 0; s < j.accepted; ++s)
+    {
+        const char* row = (const char*) j.replay + (size_t) s * j.tok_bytes;
+        const float* rk = (const float*) row;
+        const bfloat16* rv = (const bfloat16*) (row + nk * HEAD_DIM * 4);
+        const float* rg = (const float*) (row + nk * HEAD_DIM * 4 + nv * HEAD_DIM * 2);
+
+        sh_k[tid] = rk[k_head * HEAD_DIM + tid];
+        __syncthreads();
+
+        const float* sk = sh_k + bt * BTS;
+        float sum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i) sum = sum + sk[i] * st[i];
+        sh_dot1[bt][t] = sum;
+        __syncthreads();
+
+        const float g_h = rg[head];
+        const float beta_h = rg[nv + head];
+        float dot1 = 0.0f;
+        #pragma unroll
+        for (int jj = 0; jj < NSUB; ++jj) dot1 += sh_dot1[jj][t];
+        const float v = __bfloat162float(rv[head * HEAD_DIM + v_start + t]) - dot1 * g_h;
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i)
+            st[i] = st[i] * g_h + sk[i] * v * beta_h;
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (int i = 0; i < BTS; ++i) cur[col_off + (size_t) i * HEAD_DIM] = st[i];
+}
+
+void batched_state_replay(std::vector<StateReplayJob> const& jobs, int device_index)
+{
+    if (jobs.empty()) return;
+    c10::cuda::CUDAGuard device_guard((c10::DeviceIndex) device_index);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    for (size_t base = 0; base < jobs.size(); base += REWIND_MAX_JOBS)
+    {
+        int n = (int) MIN(jobs.size() - base, (size_t) REWIND_MAX_JOBS);
+        StateReplayJobBatch batch;
+        batch.num_jobs = n;
+        int max_nv = 0;
+        for (int i = 0; i < n; ++i)
+        {
+            batch.jobs[i] = jobs[base + i];
+            TORCH_CHECK(batch.jobs[i].num_v_heads <= REPLAY_MAX_HEADS && batch.jobs[i].num_k_heads > 0 &&
+                        batch.jobs[i].num_v_heads % batch.jobs[i].num_k_heads == 0,
+                        "batched_state_replay: bad head counts");
+            max_nv = MAX(max_nv, batch.jobs[i].num_v_heads);
+        }
+        dim3 blocks(max_nv * 4, n);
+        batched_state_replay_kernel<<<blocks, 128, 0, stream>>>(batch);
+        cuda_check(cudaPeekAtLastError());
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // GDN core "megakernel" for decode/verification (bsz 1, 128x128 heads, per-head decay): one
 // cooperative launch runs
@@ -2291,6 +2481,7 @@ struct GdnCoreArgs
     int num_v_heads;
     float scale;
     int history_stride;
+    GdnReplay replay;               // replay rewind, buf null: off
     // grid barrier
     unsigned* bar;
     unsigned epoch;
@@ -2542,6 +2733,12 @@ void gdn_core_mk_kernel(const GdnCoreArgs a)
     float st[BTS];
     #pragma unroll
     for (int i = 0; i < BTS; ++i) st[i] = slot_state[col_off + (size_t) i * HEAD_DIM];
+    const bool rp = save_history && a.replay.buf != nullptr;
+    if (rp)
+    {
+        #pragma unroll
+        for (int i = 0; i < BTS; ++i) slot_state[state_size + col_off + (size_t) i * HEAD_DIM] = st[i];
+    }
 
     for (int s = 0; s < seqlen; ++s)
     {
@@ -2591,20 +2788,23 @@ void gdn_core_mk_kernel(const GdnCoreArgs a)
         const float gv = -softplus(av + dt_bias_h) * a_exp_h;
         const float g_h = __expf(gv);
         const float beta_h = __bfloat162float(trunc_bf16(_sigmoid_fast_exp(bv) * a.beta_scale));
+        if (rp) gdn_replay_store(a.replay, state_slot, s, num_k_heads, num_v_heads, head, k_head, group, v_start, tid, bt, t,
+                                 sh_k, gl_v, g_h, beta_h);
         float dot1 = 0.0f;
         #pragma unroll
         for (int j = 0; j < NSUB; ++j) dot1 += sh_dot1[j][t];
         const float v = __bfloat162float(gl_v[t]) - dot1 * g_h;
         float v_out = 0.0f;
         const bool last = s == seqlen - 1;
-        float* hw = slot_state + (save_history && !last ? (size_t) (s + 1) * state_size : 0) + col_off;
+        const bool hist = save_history && !rp;
+        float* hw = slot_state + (hist && !last ? (size_t) (s + 1) * state_size : 0) + col_off;
         #pragma unroll
         for (int i = 0; i < BTS; ++i)
         {
             float state = st[i];
             state = state * g_h + sk[i] * v * beta_h;
             st[i] = state;
-            if (save_history || last) hw[(size_t) i * HEAD_DIM] = state;
+            if (hist || last) hw[(size_t) i * HEAD_DIM] = state;
             v_out = v_out + sq[i] * state;
         }
         sh_dot2[bt][t] = v_out;
@@ -2683,6 +2883,7 @@ bool gdn_core_mk
     int k_head_dim,
     int v_head_dim,
     bool history,
+    const c10::optional<at::Tensor>& replay,    // replay rewind buffer (history pass), see GdnReplay
     const c10::optional<at::Tensor>& o_suh,     // o_proj suh: also write its input transform (gated RMSNorm)
     const c10::optional<at::Tensor>& gn_w,      // [128] bf16 or float
     const c10::optional<at::Tensor>& gn_g,      // gate z, [B, S, H, 128] bf16 or float
@@ -2702,7 +2903,9 @@ bool gdn_core_mk
         if (K > CONV1D_MAX_K || conv_state.size(2) < K) return false;
         if (qkv.dtype() != at::kFloat || !qkv.is_contiguous() || !x.is_contiguous()) return false;
         if (F != 2 * num_k_heads * k_head_dim + num_v_heads * v_head_dim) return false;
-        if (history && recurrent_state.size(1) < S) return false;
+        const bool use_replay = history && replay.has_value();
+        if (history && !use_replay && recurrent_state.size(1) < S) return false;
+        if (use_replay && (replay->size(1) < S || recurrent_state.size(1) < 2)) return false;
         TORCH_CHECK(ba.numel() == (int64_t) B * S * 2 * num_v_heads, "gdn_core_mk: bad ba scratch");
         TORCH_CHECK(conv_out.numel() == (int64_t) B * S * F, "gdn_core_mk: bad conv_out");
 
@@ -2739,6 +2942,8 @@ bool gdn_core_mk
         a.num_v_heads = num_v_heads;
         a.scale = 1.0f / sqrtf((float) k_head_dim);
         a.history_stride = (int) recurrent_state.size(1);
+        a.replay = use_replay ? GdnReplay { (char*) replay->data_ptr(), (int) replay->size(1), (int) replay->size(2) }
+                              : GdnReplay { nullptr, 0, 0 };
 
         // Barrier words and per-head counters per device, zeroed once; the epoch only has to differ from
         // the previous launch's

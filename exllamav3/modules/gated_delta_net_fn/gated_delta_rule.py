@@ -101,6 +101,7 @@ def gated_delta_rule_fn(
     v_head_dim: int,
     params: dict = None,
     channelwise_g: bool = False,
+    replay: torch.Tensor | None = None,
 ):
     if params is None:
         params = {}
@@ -159,6 +160,7 @@ def gated_delta_rule_fn(
             v_head_dim,
             recurrent_slots,
             history,
+            None,
         )
         return core_attn_out
 
@@ -219,6 +221,7 @@ def gated_delta_rule_fn(
             v_head_dim,
             recurrent_slots,
             history,
+            replay if history else None,
         )
 
     return core_attn_out
