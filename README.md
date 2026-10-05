@@ -271,6 +271,21 @@ drafts again at once. Through Tabby, 800-token sampled requests, five slots (`ro
 `rocm_tests/mtp_rejoin_api.py` checks the hand-back: a long answer beside a short one, then alone again, decodes as fast
 as the same request alone (257 vs 235 chars/s).
 
+**Prompt lookup beside other jobs** (`EXL3_MTP_LOOKUP_BATCH=1`, served launcher). Prompt lookup (a job whose recent
+tokens recur earlier in its context drafts the earlier copy's continuation, ~2x on code edits) used to apply to a job
+alone only. In a batch it now replaces a job's MTP draft (or the no-draft round's single token) with the lookup
+continuation. The MTP layer ran or the carry round writes position K, so the post-verify MTP update is the drafted
+path's. The verify window is one width for the batch, so the other rows are padded; the lookup is used when its rows
+add at least half as many draft tokens as the padding adds verify rows, and its accept rate tunes the same match
+threshold as the single-job lookup. `rocm_tests/conc_edit_api.py` (each request renames a method in a different
+140-line block and outputs the block, greedy):
+
+| | lookup alone only | lookup in batches (served) |
+|---|---|---|
+| 2 edits at once | 66-77 tok/s total | 71-83 |
+| 3 edits at once | 70 (24 each) | **100 (35-38 each)** |
+| free text, 2 / 5 at once | 57-62 / 81-82 | 57-63 / 80 |
+
 `EXL3_PREFIX_LOG=8192` (served launcher) prints one line per started prompt of at least that many tokens: how far its
 pages match the cache, whether the first miss is changed content or an evicted page, the checkpoints below it and what
 was reused.
@@ -727,6 +742,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_STASH_LADDER` | 1 | recurrent checkpoint eviction by replay cost instead of LRU; `_TIP` (4) weights a conversation's latest checkpoint, `_IDLE` (600 s) discounts idle conversations |
 | `EXL3_PREFIX_LOG` | 0 (8192 in the served launcher) | log prefix-cache and checkpoint reuse for prompts of at least N tokens |
 | `EXL3_MTP_BATCH_MIN`, `EXL3_MTP_BATCH_DRAFTS` | 0 (off), 0 (3 and 0 in the served launcher) | with at least MIN decoding jobs, MTP drafts per job (0 = none; the MTP layer still writes its K/V) |
+| `EXL3_MTP_LOOKUP_BATCH` | 0 (1 in the served launcher) | prompt lookup for jobs in a batch, in place of their MTP draft, when it pays for the padding |
 | `EXL3_KV_STREAM_STATS`, `EXL3_KV_STREAM_VERIFY` | 0, 0 | print slot hit counters every N calls; check every streamed read against the host copy (debug, slow) |
 
 ## Tests and benchmarks (`rocm_tests/`)
@@ -759,6 +775,7 @@ verification from ~45 ms to ~14 ms per round.
 | `kv_stage_bench.py` | staging bandwidth: DMA runs vs the page-gather kernel |
 | `conc_test.py <url> <tag>`, `conc_long.py <url> <tag>` | concurrency through the API: two sampled requests alone and at once (first token, per-request and total tok/s); a short edit arriving during a long prefill and its decode rate while the long prompt is read (needs `max_tokens` honoured) |
 | `cancel_api.py <url>` | client disconnects mid-stream, alone and beside a running request; a later request must complete |
+| `conc_edit_api.py <url> <tag> <n>` | n code edits (rename a method, output the block) alone and at once: per-request and total decode rate (prompt lookup in batches) |
 | `mtp_rejoin_api.py <url> <tag>` | a long answer alone, then beside a short request and alone again: its decode rate after the short one ends (MTP cache consistency after batched rounds) |
 | `prune_api.py <url> <tag>` | a ~100K conversation built over 30 turns, then an early turn rewritten: first-token time of the re-read (checkpoint reuse) |
 | `stash_ladder_unit.py` | recurrent checkpoint retention (ladder vs LRU) on a mock page table, CPU only |

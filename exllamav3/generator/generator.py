@@ -34,6 +34,11 @@ _decode_share = float(os.environ.get("EXL3_DECODE_SHARE", 0.5))
 # than they win
 _mtp_batch_min = int(os.environ.get("EXL3_MTP_BATCH_MIN", 0))
 _mtp_batch_drafts = int(os.environ.get("EXL3_MTP_BATCH_DRAFTS", 0))
+# Prompt lookup beside other jobs (EXL3_MTP_LOOKUP_BATCH=1): a job whose suffix recurs earlier in its context drafts the
+# earlier copy's continuation in place of its MTP draft. The verify window is one width for the whole batch, so the
+# other rows are padded; the lookup is used when its rows add at least half as many draft tokens as the padding adds
+# verify rows
+_mtp_lookup_batch = os.environ.get("EXL3_MTP_LOOKUP_BATCH", "0") != "0"
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -218,6 +223,7 @@ class Generator:
         self._lookup_round = None
         self._lookup_len = 0
         self._carry_round = None
+        self._batch_lookup = None
         self.lookup_stats = [0, 0, 0]   # rounds, drafted, accepted
         # Self-tuning match threshold: a lookup round that loses more than half its draft raises the
         # suffix length a match needs by 2, a fully accepted one lowers it by 1 (never below mtp_lookup_min).
@@ -645,12 +651,16 @@ class Generator:
                 for job in self.active_jobs:
                     job.coupled_base = None
                 self._carry_round = None
+                self._batch_lookup = None
                 draft_tokens = self.iterate_mtp_lookup() if self.mtp_lookup_min else None
                 if draft_tokens is None:
                     draft_tokens = self.iterate_draftmodel_mtp_gen(results)
+                    if _mtp_lookup_batch and self.mtp_lookup_min:
+                        draft_tokens = self.iterate_mtp_lookup_batch(draft_tokens)
                 self.iterate_gen(results, draft_tokens)
                 self._lookup_round = None
                 self._carry_round = None
+                self._batch_lookup = None
             else:
                 draft_tokens = self.iterate_draftmodel_gen(results)
                 self.iterate_gen(results, draft_tokens)
@@ -965,6 +975,51 @@ class Generator:
         self.lookup_stats[0] += 1
         self.lookup_stats[1] += draft.shape[-1]
         return draft
+
+
+    def iterate_mtp_lookup_batch(self, draft_tokens):
+        """
+        Prompt lookup for a batch (EXL3_MTP_LOOKUP_BATCH): rows whose suffix recurs earlier in their context take the
+        earlier copy's continuation in place of their MTP draft (or the no-draft round's single token). The MTP layer
+        already ran (or the carry round writes position K), so the post-verify K/V update is the drafted path's.
+        Returns the round's draft tensor, the given one if no lookup pays for the padding it adds.
+        """
+        if self.draft_calibrator is not None:
+            return draft_tokens
+        if draft_tokens is None and self._carry_round is None:
+            return draft_tokens
+        jobs = [job for job in self.active_jobs if job.is_prefill_done()]
+        if len(jobs) < 2:
+            return draft_tokens
+        w = draft_tokens.shape[-1] if draft_tokens is not None else 0
+        thresh = max(self.lookup_thresh, self.mtp_lookup_min)
+        found = {}
+        for row, job in enumerate(jobs):
+            if job.sam is None or len(job.sequences) != 1:
+                continue
+            d = job.get_ngram_draft(self.mtp_lookup_max, thresh)
+            if d.shape[-1] >= self.mtp_lookup_minlen and d.shape[-1] > w:
+                found[row] = d
+        if not found:
+            return draft_tokens
+        width = max(d.shape[-1] for d in found.values())
+        gain = sum(d.shape[-1] - w for d in found.values())
+        if 2 * gain < len(jobs) * (width - w):
+            return draft_tokens
+        out = torch.zeros((len(jobs), width), dtype = torch.long)
+        if w:
+            out[:, :w].copy_(draft_tokens[:len(jobs)])
+            out[:, w:] = out[:, w - 1:w]
+        else:
+            for row, job in enumerate(jobs):
+                out[row, :] = job.sequences[0].sequence_ids.torch()[0, -1]
+        for row, d in found.items():
+            out[row, :d.shape[-1]].copy_(d[0])
+            out[row, d.shape[-1]:] = d[0, -1]
+        self._batch_lookup = {row: d.shape[-1] for row, d in found.items()}
+        self.lookup_stats[0] += len(found)
+        self.lookup_stats[1] += sum(self._batch_lookup.values())
+        return out
 
 
     # TODO: Refactor, share code with other draft fns
@@ -1531,6 +1586,15 @@ class Generator:
                 # window into the draft cache
                 if id(job) in rewound_jobs:
                     continue
+
+                # A batched lookup row tunes the shared match threshold as the single-job lookup does
+                if self._batch_lookup is not None and a_idx in self._batch_lookup:
+                    n_look = self._batch_lookup[a_idx]
+                    self.lookup_stats[2] += accepted_length - 1
+                    if accepted_length - 1 >= n_look:
+                        self.lookup_thresh = max(self.mtp_lookup_min, self.lookup_thresh - 1)
+                    elif 2 * (accepted_length - 1) < n_look:
+                        self.lookup_thresh = min(64, self.lookup_thresh + 2)
 
                 # A prompt-lookup round never ran the MTP layer: write its K/V for every accepted position
                 # K..K+A-1, the first paired with the carry state the MTP would have drafted from
