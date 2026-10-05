@@ -181,7 +181,8 @@ so ~1.5 GB less is available. Without the variable, nothing changes.
 
 **Served profile since 2026-10-05:** 512K (YaRN x2), `EXL3_KV_STREAM=1`, `max_batch_size: 5` (up to five requests
 decode together), `cpu_moe_split_experts: 362` with `EXL3_GDN_REPLAY=1` (380 before it: each slot beyond the first
-needed ~6 more CPU experts per layer, ~2 with replay), plus the concurrency switches below. The 400K needle run with
+needed ~6 more CPU experts per layer, ~2 with replay), plus the concurrency switches below (including
+`EXL3_MB_OVERLAP=1`). The 400K needle run with
 replay: 3/3, decode at that context 45 / 34 tok/s; at 380 without replay, prefill 350 s (1,140 tok/s) and ~9.4 GB of
 RAM still available afterwards.
 
@@ -307,6 +308,38 @@ layer instead of 380 (400K needles 3/3, no OOM):
 | code edit alone | 66-97 | 88-93 |
 | three edits at once, each | 35-38 | 37-40 |
 | five at once, total (each) | 82-83 (17-18) | 86-88 (18-19) |
+
+**Two micro-batches per decode step** (`EXL3_MB_OVERLAP=1`, served launcher; needs the `greenlet` package). With
+several rows decoding, the GPU and the CPU expert worker mostly take turns: per MoE layer the GPU runs attention, the
+router and its own experts, then waits for the worker's tail experts, and the worker waits while the GPU does the
+next layer's attention. Measured per step with `rocm_tests/batch_prof.py` (no drafts, mcs 362), the worker computes
+~35 us per selected CPU expert (~53 GB/s, RAM bandwidth), so its time grows linearly with the rows, while it idles
+13-17 ms per step:
+
+| rows | step | worker computing | worker idle | GPU waiting on the worker |
+|---|---|---|---|---|
+| 1 | 19 ms | 7 ms | 13 ms | 7 ms |
+| 2 | 34 ms | 18-22 ms | 14 ms | 20 ms |
+| 3 | 41 ms | 25 ms | 16 ms | 21 ms |
+| 5 | 59 ms | 41 ms | 17 ms | 32 ms |
+
+With at least `EXL3_MB_OVERLAP_MIN` (3) rows, the generator splits the batch into two micro-batches and
+`Model.forward_overlap` runs each forward in a greenlet on the same stream, switching at every CPU-split MoE layer
+just before the collect: micro-batch A hands its experts to the worker, then B's attention and GPU experts are queued
+while the worker computes A's, and so on. Stream order alone keeps the GPU work correct; the second micro-batch takes
+its own static workspaces (`g_tensor_cache.tag`), since buffers such as the hyper-connection mix and the routed sum
+are still owed to the first one across the switch. The dense weights are read twice per step, which is why two rows
+gain nothing and the split starts at three. `rocm_tests/mb_overlap_check.py` compares the interleaved run with the
+same split run one micro-batch after the other: the steps until the first argmax difference and the logit
+differences before it (20 steps, 1.18) are within the run-to-run spread of the sequential mode itself (24, 1.29);
+the extra VRAM is negligible.
+
+| five slots, mcs 362 | off | **on (served)** |
+|---|---|---|
+| generator, no drafts: 3 / 5 rows | 66.6 / 78.3 tok/s | 74.6 / 87.7 |
+| API: five requests at once, total | 82.6-84.2 | 87.0-88.0 |
+| API: three code edits at once, total | 78.4-84.0 | 89.3-90.5 |
+| single requests, MTP rejoin after a batch | unchanged | unchanged |
 
 `EXL3_PREFIX_LOG=8192` (served launcher) prints one line per started prompt of at least that many tokens: how far its
 pages match the cache, whether the first miss is changed content or an evicted page, the checkpoints below it and what
@@ -766,6 +799,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_MTP_BATCH_MIN`, `EXL3_MTP_BATCH_DRAFTS` | 0 (off), 0 (3 and 0 in the served launcher) | with at least MIN decoding jobs, MTP drafts per job (0 = none; the MTP layer still writes its K/V) |
 | `EXL3_MTP_LOOKUP_BATCH` | 0 (1 in the served launcher) | prompt lookup for jobs in a batch, in place of their MTP draft, when it pays for the padding |
 | `EXL3_GDN_REPLAY` | 0 (1 in the served launcher) | GDN rewind by replay: 2 recurrent states per slot instead of max_history + 1 |
+| `EXL3_MB_OVERLAP`, `EXL3_MB_OVERLAP_MIN` | 0 (1 in the served launcher), 3 | decode batches of at least MIN rows as two micro-batches interleaved per CPU-split MoE layer (needs `greenlet`); `seq` = same split without interleaving |
 | `EXL3_KV_STREAM_STATS`, `EXL3_KV_STREAM_VERIFY` | 0, 0 | print slot hit counters every N calls; check every streamed read against the host copy (debug, slow) |
 
 ## Tests and benchmarks (`rocm_tests/`)
@@ -794,6 +828,8 @@ verification from ~45 ms to ~14 ms per round.
 | `prefill_bench.py -m <model> [--chunk N] [--mtp] [--warm]` | prefill tok/s through the Generator on fresh prompts, with n-gram prefetch hit counts |
 | `dist_check.py -m <model>` | token-distribution check of coupled vs uncoupled speculative sampling |
 | `gdn_replay_unit.py` | GDN replay rewind vs stored history, bit-exact, at the kernel level |
+| `batch_prof.py -m <model> [--bsz 1,2,3,5]` | batched decode step breakdown: wall, host enqueue, GPU-stream time per module (the CPU collect is the wait on the worker); `EXL3_MOE_HANDOFF_PROF=1` adds the worker's compute / idle per job |
+| `mb_overlap_check.py -m <model>` | micro-batch overlap vs the same split run sequentially (greedy, five jobs), against the sequential run-to-run spread; speed and extra VRAM per mode |
 | `kv_stream_unit.py` | KV streaming kernels vs a torch reference: multi-step selections, eviction pressure, invalidating writes, page copies |
 | `kv_stream_check.py -m <model> --stream 0\|1 [--out F] [--ref F]` | greedy jobs (long prompt, shared prefix, recycled pages) with streaming off / on; with `EXL3_KV_STREAM_VERIFY=1` the bit-exact read check |
 | `kv_stage_bench.py` | staging bandwidth: DMA runs vs the page-gather kernel |

@@ -1000,7 +1000,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.routing_first and self.num_local_experts != self.num_experts:
             sel = sel - self.routing_first
         w = routing_weights if routing_weights.dtype == torch.half else routing_weights.half()
-        out = st["out"][:bsz]
+        out = st["out"] if not g_tensor_cache.tag else \
+            g_tensor_cache.get(self.device, st["out"].shape, torch.float, "rdna3_moe_out")
+        out = out[:bsz]
         mg, mu, md = self.multi_gate, self.multi_up, self.multi_down
         ok = ext.exl3_rdna3_moe_decode(
             y.contiguous(), sel.contiguous(), w.contiguous(),
@@ -1405,6 +1407,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             self.bc.run_bszN(y, selected_experts, routing_weights)
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
+
+        # Micro-batch overlap (Model.forward_overlap): hand the stream to the other micro-batch while the worker
+        # computes this one's CPU experts, collect after. Only the RDNA3 decode path, whose routed sum lives in a
+        # per-micro-batch buffer
+        mb_yield = params.get("mb_yield")
+        if mb_yield is not None and cpu_pending is not None and rdna3_moe:
+            mb_yield()
 
         # CPU tail partial folds in before the post norms (nonlinear: they must see the
         # complete routed sum)

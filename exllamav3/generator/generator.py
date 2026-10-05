@@ -39,6 +39,18 @@ _mtp_batch_drafts = int(os.environ.get("EXL3_MTP_BATCH_DRAFTS", 0))
 # other rows are padded; the lookup is used when its rows add at least half as many draft tokens as the padding adds
 # verify rows
 _mtp_lookup_batch = os.environ.get("EXL3_MTP_LOOKUP_BATCH", "0") != "0"
+
+# EXL3_MB_OVERLAP: decode batches of at least EXL3_MB_OVERLAP_MIN rows run as two micro-batches interleaved at every
+# CPU-split MoE layer (Model.forward_overlap), so the GPU computes one micro-batch while the CPU worker computes the
+# other's experts. "seq" runs the same split without interleaving (A/B checks). Needs the greenlet package
+_mb_overlap = os.environ.get("EXL3_MB_OVERLAP", "0")
+_mb_overlap_min = int(os.environ.get("EXL3_MB_OVERLAP_MIN", 3))
+if _mb_overlap not in ("0", "seq"):
+    try:
+        import greenlet as _greenlet
+    except ImportError:
+        print(" !! EXL3_MB_OVERLAP needs the greenlet package; micro-batch overlap is off")
+        _mb_overlap = "0"
 from .job import Job
 from .filter import Filter
 from concurrent.futures import ThreadPoolExecutor
@@ -1157,6 +1169,33 @@ class Generator:
         return draft_ids
 
 
+    def _forward_micro_batches(self, batch_ids, params):
+        """
+        Decode forward of one-sequence jobs as two micro-batches (rows split in half) through
+        Model.forward_overlap. Row-indexed inputs are sliced per micro-batch; outputs (logits, the exported trunk
+        states for the draft model) are concatenated back in row order, so the caller sees one batch.
+        """
+        bsz = batch_ids.shape[0]
+        cut = bsz // 2
+        batches = []
+        for r0, r1 in ((0, cut), (cut, bsz)):
+            p = dict(params)
+            # The embedding's pinned upload buffer is keyed by shape: two micro-batches of one shape would rewrite
+            # it before the first upload ran
+            p.pop("pinned_staging", None)
+            p["block_table"] = params["block_table"][r0:r1]
+            p["cache_seqlens"] = params["cache_seqlens"][r0:r1]
+            if params.get("positions") is not None:
+                p["positions"] = params["positions"][r0:r1]
+            if params.get("recurrent_states") is not None:
+                p["recurrent_states"] = params["recurrent_states"][r0:r1]
+            batches.append((batch_ids[r0:r1], p))
+        outs = self.model.forward_overlap(batches, interleave = _mb_overlap != "seq")
+        states = [p.get("export_states") for _, p in batches]
+        if states[0] is not None:
+            params["export_states"] = [torch.cat(parts, dim = 0) for parts in zip(*states)]
+        return torch.cat(outs, dim = 0)
+
     def _staging(self, name, rows: int, width: int | None = None, dtype = torch.int32):
         """
         Reusable pinned staging buffer, keyed by name and row width, grown by rows on demand.
@@ -1269,10 +1308,16 @@ class Generator:
         }
         if self.draft_model:
             params.update(self.draft_model.draft_verifier_params)
-        batch_logits = self.model.forward(
-            input_ids = batch_ids,
-            params = params,
-        )
+        if (
+            _mb_overlap != "0" and batch_size >= _mb_overlap_min and len(batch_jobs) == batch_size and
+            not active_embeddings and not self.model.loaded_tp
+        ):
+            batch_logits = self._forward_micro_batches(batch_ids, params)
+        else:
+            batch_logits = self.model.forward(
+                input_ids = batch_ids,
+                params = params,
+            )
 
         # Keep only the fields needed below for draft-cache updates and drop the params dict so it cannot extend
         # references to recurrent state objects past this iteration.

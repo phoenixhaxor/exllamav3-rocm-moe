@@ -214,13 +214,16 @@ def save_tensor_image(
 class GTensorCache:
     def __init__(self):
         self.cache = {}
+        # Micro-batch overlap (Model.forward_overlap): the second micro-batch's workspaces get their own entries, so
+        # a buffer still owed to one micro-batch's deferred work is never rewritten by the other's
+        self.tag = ""
 
     def make_key(self, device, shape, dtype, x):
         device = torch.device(device)
         return f"{device}/{str(shape)}/{str(dtype)}/{x}"
 
     def get(self, device, shape, dtype, x = ""):
-        key = self.make_key(device, shape, dtype, x)
+        key = self.make_key(device, shape, dtype, x + self.tag)
         if key not in self.cache:
             refc, v = (0, torch.empty(shape, dtype = dtype, device = device))
         else:

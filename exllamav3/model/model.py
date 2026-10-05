@@ -395,6 +395,51 @@ class Model(Model_TPMixin, Model_LSMixin):
             return y
 
 
+    @torch.inference_mode
+    def forward_overlap(self, batches: list, interleave: bool = True):
+        """
+        Forward several micro-batches [(input_ids, params), ...] that share one CUDA stream, interleaved at every
+        CPU-split MoE layer: a micro-batch runs up to the point where it would wait for the CPU worker's experts,
+        then hands over to the next one, so the GPU works on another micro-batch while the worker computes, and
+        the worker gets the next micro-batch's job while the GPU finishes the first. Each forward runs in its own
+        greenlet (switching costs about a microsecond, the stream order alone keeps the GPU work correct); the
+        second micro-batch takes its own static workspaces (g_tensor_cache.tag). interleave = False runs the same
+        split one micro-batch after the other, for A/B checks. Returns the outputs in order.
+        """
+        outs = [None] * len(batches)
+        if not interleave:
+            for i, (ids, p) in enumerate(batches):
+                g_tensor_cache.tag = f"#mb{i}" if i else ""
+                try:
+                    outs[i] = self.forward(ids, p)
+                finally:
+                    g_tensor_cache.tag = ""
+            return outs
+        from greenlet import greenlet, getcurrent
+        main = getcurrent()
+        def body(i, ids, p):
+            def run():
+                outs[i] = self.forward(ids, p)
+            return run
+        lets = []
+        for i, (ids, p) in enumerate(batches):
+            p["mb_yield"] = main.switch
+            lets.append(greenlet(body(i, ids, p)))
+        try:
+            live = list(range(len(lets)))
+            while live:
+                for i in list(live):
+                    g_tensor_cache.tag = f"#mb{i}" if i else ""
+                    lets[i].switch()
+                    if lets[i].dead:
+                        live.remove(i)
+        finally:
+            g_tensor_cache.tag = ""
+            for _, p in batches:
+                p.pop("mb_yield", None)
+        return outs
+
+
     def unload(self):
         for module in self.modules:
             module.unload()
