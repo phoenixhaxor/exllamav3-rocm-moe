@@ -428,7 +428,11 @@ Environment for the prompt-lookup drafts (`max_history` must cover the lookup wi
 
 Run TabbyAPI with `EXL3_NOGRAPH=mlp,gdn,moe,attn` (MoE models need `moe`: the CPU-offloaded expert path cannot run
 inside a HIP graph, and loading fails with `Graph update failed` in `run_single_expert` otherwise; eager `attn` costs
-nothing at decode and avoided a rare graph-replay crash under agent load). `rocm/scripts/run_tabbyapi.sh` defaults to
+nothing at decode and avoided a rare graph-replay crash under agent load). Graphed decode modules used to grow VRAM
+on ROCm: every argument update of an instantiated graph (the attention graphs update sequence lengths and block
+tables every step) takes a fresh kernel-argument slot from 132 KiB device-memory chunks that are only released with
+the graph exec, ~10 KiB per generated token, until VRAM ran out (issue #4). `Graph` now re-instantiates its exec
+after 2048 argument updates (`EXL3_GRAPH_REINSTANTIATE`). `rocm/scripts/run_tabbyapi.sh` defaults to
 `mlp,gdn`, which is for the dense models. Memory at this setting: 21.9 GB VRAM, ~33 GB RAM for the CPU experts, the
 rest of RAM as page cache for the n-gram table.
 
@@ -778,6 +782,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_FUSE_NORM_HAD` | 1 | 0 = no matmul input transform in the RMSNorm tail |
 | `EXL3_RESID_DEFER` | 1 | 0 = no residual-add folding into the next block's input norm |
 | `EXL3_NOGRAPH` | - (`mlp,gdn` in `run_tabbyapi.sh`) | modules (`mlp`, `gdn`, `moe`, `attn`) that decode eagerly instead of through a HIP graph; MoE models with CPU experts need `moe` |
+| `EXL3_GRAPH_REINSTANTIATE` | 2048 (ROCm) | re-instantiate a decode graph's exec after this many kernel-argument updates, releasing the per-update argument memory ROCm otherwise keeps until the exec is destroyed; 0 = never |
 | `EXL3_WATCHDOG_S` | 300 | a generator iteration running longer than this dumps all stacks and exits the process (0 = off) |
 | `EXL3_MTP_LOOKUP`, `EXL3_MTP_LOOKUP_MAX` | 0, 5 | prompt lookup beside MTP drafting: minimum suffix match (0 = off) and draft length |
 | `EXL3_QSA_NS`, `EXL3_QSA_BN`, `EXL3_QSA_NW` | 1, 32, 4 | launch parameters of the QSA sparse attention kernel used by prefill |
@@ -809,7 +814,7 @@ verification from ~45 ms to ~14 ms per round.
 | `test_rdna3_gemm.py <model_dir> [tensor ...]` | EXL3 matmul vs. reconstructed weights (m = 1..144, fp16/fp32 out) and an independent numpy trellis decoder |
 | `test_rdna3_mgemm.py <model_dir>` | multi-matrix matmul (gate/up, sliced qkv/z and q/k/v) and the fused prologues (silu, output gate, gated norm) vs. the unfused kernels |
 | `bench_ab.py -m <model> -dm <draft> [--variants ...]` | in-process A/B of decode-loop options at fixed greedy acceptance: median ms per speculative round (the reliable speed metric) |
-| `micro/*.cc` | standalone HIP microbenchmarks: peak read bandwidth (`peakbw`), EXL3-like strided access (`stridebw`), kernel boundary vs grid barrier (`gridbar`), idle after large kernels (`tailgap`) |
+| `micro/*.cc` | standalone HIP microbenchmarks: peak read bandwidth (`peakbw`), EXL3-like strided access (`stridebw`), kernel boundary vs grid barrier (`gridbar`), idle after large kernels (`tailgap`), device memory per graph argument update (`graph_update_mem`) |
 | `bw.py -m <model> [-dm <draft>] [--rows]` | practical peak bandwidth vs every EXL3 matmul at 1 / 8 rows, per projection kind; `--rows`: whole-pass scaling 1-16 rows |
 | `timeline.py -m <model> -dm <draft> [--stack] [--ops]` | GPU ops and large gaps inside individual rounds, with the CPU frames running during each gap |
 | `test_gdn_mk.py`, `test_presample.py`, `test_abl_fuse.py`, `test_abl_noise.py` | bit-identity / numerics checks for the megakernel, batched sampling and runtime ablation |
@@ -829,6 +834,7 @@ verification from ~45 ms to ~14 ms per round.
 | `dist_check.py -m <model>` | token-distribution check of coupled vs uncoupled speculative sampling |
 | `gdn_replay_unit.py` | GDN replay rewind vs stored history, bit-exact, at the kernel level |
 | `batch_prof.py -m <model> [--bsz 1,2,3,5]` | batched decode step breakdown: wall, host enqueue, GPU-stream time per module (the CPU collect is the wait on the worker); `EXL3_MOE_HANDOFF_PROF=1` adds the worker's compute / idle per job |
+| `graph_mem_check.py -m <model>` | VRAM growth (per-process DRM memory) per generated token with the decode graphs on; run with `EXL3_GRAPH_REINSTANTIATE=0` to see the ROCm argument-update growth |
 | `mb_overlap_check.py -m <model>` | micro-batch overlap vs the same split run sequentially (greedy, five jobs), against the sequential run-to-run spread; speed and extra VRAM per mode |
 | `kv_stream_unit.py` | KV streaming kernels vs a torch reference: multi-step selections, eviction pressure, invalidating writes, page copies |
 | `kv_stream_check.py -m <model> --stream 0\|1 [--out F] [--ref F]` | greedy jobs (long prompt, shared prefix, recycled pages) with streaming off / on; with `EXL3_KV_STREAM_VERIFY=1` the bit-exact read check |

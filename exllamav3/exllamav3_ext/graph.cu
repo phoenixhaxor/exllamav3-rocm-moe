@@ -46,12 +46,40 @@ Graph::Graph()
     graph = NULL;
     graph_exec = NULL;
     need_cublas = false;
+    updates_since_instantiate = 0;
+    retired_exec = NULL;
+    retired_done = NULL;
+}
+
+// ROCm (CLR graph packet capture) gives every hipGraphExecKernelNodeSetParams on an instantiated graph a fresh
+// kernel-argument slot, carved from 132 KiB device-memory chunks that are only released when the exec is
+// destroyed. A decode graph whose arguments change every step (sequence lengths, block tables) then grows VRAM
+// without bound (~10 KiB per generated token through the attention graphs, issue #4). After this many argument
+// updates, launch() re-instantiates the exec from the captured graph, which releases them.
+// EXL3_GRAPH_REINSTANTIATE=0 disables this; CUDA reuses the argument storage and never needs it
+static int64_t graph_reinstantiate_after()
+{
+    #ifdef __HIP_PLATFORM_AMD__
+        static const int64_t n = [](){
+            const char* e = std::getenv("EXL3_GRAPH_REINSTANTIATE");
+            return e ? (int64_t) atoll(e) : (int64_t) 2048;
+        }();
+        return n;
+    #else
+        return 0;
+    #endif
 }
 
 Graph::~Graph()
 {
     if (graph) cudaGraphDestroy(graph);
     if (graph_exec) cudaGraphExecDestroy(graph_exec);
+    if (retired_exec)
+    {
+        cudaEventSynchronize(retired_done);
+        cudaGraphExecDestroy(retired_exec);
+    }
+    if (retired_done) cudaEventDestroy(retired_done);
 }
 
 cudaStream_t Graph::capture_begin()
@@ -166,6 +194,28 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
         cublasSetWorkspace(cublas_handle, ws, WORKSPACE_SIZE);
     }
 
+    // Re-instantiate (see graph_reinstantiate_after). The fresh exec starts from the captured arguments, so every
+    // node with patched arguments is applied again below. The old exec's argument memory must outlive its queued
+    // launches: it is retired with an event, and destroyed at the next re-instantiation (by then long finished, so
+    // the event wait does not stall the stream)
+    const int64_t reinst = graph_reinstantiate_after();
+    if (reinst > 0 && updates_since_instantiate >= reinst)
+    {
+        if (retired_exec)
+        {
+            cuda_check(cudaEventSynchronize(retired_done));
+            cuda_check(cudaGraphExecDestroy(retired_exec));
+        }
+        else
+            cuda_check(cudaEventCreateWithFlags(&retired_done, cudaEventDisableTiming));
+        retired_exec = graph_exec;
+        cuda_check(cudaEventRecord(retired_done, stream));
+        cuda_check(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0));
+        for (auto& site : graph_node_sites)
+            node_needs_update[std::get<0>(site)] = true;
+        updates_since_instantiate = 0;
+    }
+
     int p = 0;
     int n = 0;
     while (true)
@@ -208,6 +258,7 @@ void Graph::launch(std::vector<PPTR> params, cudaStream_t stream)
         else
             cuda_check(cudaGraphExecKernelNodeSetParams(graph_exec, nodes[n], &node_params[n]));
         node_needs_update[n] = false;
+        updates_since_instantiate++;
     }
 
     cuda_check(cudaGraphLaunch(graph_exec, stream));

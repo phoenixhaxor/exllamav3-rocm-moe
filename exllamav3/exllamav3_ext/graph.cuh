@@ -120,6 +120,12 @@ public:
     std::vector<void*> current_values;
     std::vector<bool> node_needs_update;
 
+    // Kernel-node argument updates applied to graph_exec since it was instantiated, and the previous exec retired
+    // by the last re-instantiation with an event after its final launch (see launch())
+    int64_t updates_since_instantiate;
+    cudaGraphExec_t retired_exec;
+    cudaEvent_t retired_done;
+
     bool need_cublas;
     bool ready;
     bool ready_to_record;
