@@ -45,6 +45,16 @@ _mtp_lookup_batch = os.environ.get("EXL3_MTP_LOOKUP_BATCH", "0") != "0"
 # other's experts. "seq" runs the same split without interleaving (A/B checks). Needs the greenlet package
 _mb_overlap = os.environ.get("EXL3_MB_OVERLAP", "0")
 _mb_overlap_min = int(os.environ.get("EXL3_MB_OVERLAP_MIN", 3))
+# EXL3_PREFILL_GROUP: prompt chunks of several jobs in one prefill round, up to max_chunk_size tokens together, run
+# their CPU/streamed experts once over all rows (generator/prefill_group.py). Needs the greenlet package
+_pf_group_on = os.environ.get("EXL3_PREFILL_GROUP", "0") != "0"
+_pf_group_log = os.environ.get("EXL3_PREFILL_GROUP_LOG", "0") != "0"
+if _pf_group_on:
+    try:
+        import greenlet as _greenlet
+    except ImportError:
+        print(" !! EXL3_PREFILL_GROUP needs the greenlet package; grouped prefill is off")
+        _pf_group_on = False
 if _mb_overlap not in ("0", "seq"):
     try:
         import greenlet as _greenlet
@@ -249,6 +259,7 @@ class Generator:
         self.max_batch_size = max_batch_size
         self.max_chunk_size = max_chunk_size
         self._prefill_debt = 0.0
+        self._pf_group = None
 
         # Job queues
         self.job_serial = 0
@@ -633,13 +644,17 @@ class Generator:
             t_dec = time.perf_counter()
             deferred = [job for job in prefilling if job.prefill_remaining() > self.max_chunk_size]
         t_pf = time.perf_counter()
-        for job in list(self.active_jobs):
-            if job in deferred:
+        pf_jobs = [job for job in list(self.active_jobs) if job not in deferred]
+        group = self._prefill_group_select(pf_jobs) if _pf_group_on else []
+        for job in pf_jobs:
+            if job in group:
                 continue
             try:
                 job.prefill(results)
             except Exception as e:
                 self.reap_failed_job(job, e, results)
+        if group:
+            self._prefill_grouped(group, results)
         if decoding and len(prefilling) > len(deferred):
             cuda_sync_active()
             dt = time.perf_counter() - t_pf
@@ -1168,6 +1183,49 @@ class Generator:
         draft_ids = torch.cat([d[:, :min_len] for d in draft_ids], dim = 0)
         return draft_ids
 
+
+    def _prefill_group_select(self, jobs):
+        """
+        Jobs whose next prompt chunks are read together this round: single-sequence jobs with a prompt chunk pending
+        of at least the CPU worker's streaming row minimum, smallest first, up to max_chunk_size tokens in total (the
+        rows one chunk may hold, so the VRAM a prefill round needs stays what the load budgeted). Fewer than two: none.
+        """
+        cand = []
+        for job in jobs:
+            if job.is_prefill_done() or len(job.sequences) != 1 or job.embeddings:
+                continue
+            n = min(job.prefill_remaining(), self.max_chunk_size)
+            if n >= 32:
+                cand.append((n, job))
+        cand.sort(key = lambda c: c[0])
+        group, total = [], 0
+        for n, job in cand:
+            if total + n > self.max_chunk_size:
+                break
+            group.append(job)
+            total += n
+        return group if len(group) >= 2 else []
+
+    def _prefill_grouped(self, jobs, results):
+        """One prefill round of several jobs, their chunks interleaved per MoE layer (see PrefillGroup)"""
+        from .prefill_group import PrefillGroup
+        def make(job):
+            def run():
+                try:
+                    job.prefill(results)
+                except Exception as e:
+                    self.reap_failed_job(job, e, results)
+            return run
+        self._pf_group = PrefillGroup()
+        t0 = time.perf_counter()
+        try:
+            self._pf_group.run([make(job) for job in jobs])
+        finally:
+            self._pf_group = None
+        if _pf_group_log:
+            cuda_sync_active()
+            print(f" -- prefill group: {len(jobs)} jobs, "
+                  f"{time.perf_counter() - t0:.2f} s", flush = True)
 
     def _forward_micro_batches(self, batch_ids, params):
         """

@@ -182,7 +182,7 @@ so ~1.5 GB less is available. Without the variable, nothing changes.
 **Served profile since 2026-10-05:** 512K (YaRN x2), `EXL3_KV_STREAM=1`, `max_batch_size: 5` (up to five requests
 decode together), `cpu_moe_split_experts: 362` with `EXL3_GDN_REPLAY=1` (380 before it: each slot beyond the first
 needed ~6 more CPU experts per layer, ~2 with replay), plus the concurrency switches below (including
-`EXL3_MB_OVERLAP=1`). The 400K needle run with
+`EXL3_MB_OVERLAP=1` and `EXL3_PREFILL_GROUP=1`). The 400K needle run with
 replay: 3/3, decode at that context 45 / 34 tok/s; at 380 without replay, prefill 350 s (1,140 tok/s) and ~9.4 GB of
 RAM still available afterwards.
 
@@ -340,6 +340,30 @@ the extra VRAM is negligible.
 | API: five requests at once, total | 82.6-84.2 | 87.0-88.0 |
 | API: three code edits at once, total | 78.4-84.0 | 89.3-90.5 |
 | single requests, MTP rejoin after a batch | unchanged | unchanged |
+
+**Short prompts read together** (`EXL3_PREFILL_GROUP=1`, served launcher; needs `greenlet`). A prompt chunk streams
+every CPU expert that enough of its tokens route to over PCIe, so a short chunk pays a near-fixed cost: through the
+Generator (`rocm_tests/prefill_short_ab.py`, mcs 362), 1K tokens take 2.3 s, 2K 2.75 s, 4K 4.1 s and 6K 5.1 s, about
+1.7 s of fixed cost. An agent turn adds 1-6K tokens, so with several agents each turn pays it again. (The streaming
+threshold, `EXL3_MOE_STREAM_T`, is at its best at the default 8 for every length from 1K to 6K: 4, 12, 16 and 24 were
+all as fast or slower. Strata's CPU share for short chunks, `STRATA_PREFILL_CPU_SHARE`, splits the same work by
+measured time; the static threshold already sits at that balance here.)
+
+When several jobs have a prompt chunk pending in the same prefill round and their chunks fit in one chunk together
+(`max_chunk_size`, so the VRAM a round needs is what the load budgeted for), each job's chunk forward runs in a
+greenlet, and at every CPU-split MoE layer they meet: the CPU and streamed experts run once over all of their rows,
+and each job gets its rows back (`generator/prefill_group.py`). Attention, the GDN layers and the GPU-resident
+experts still run per job. The first-token logits after a grouped prefill differ from the separate ones by as much
+as two separate runs differ from each other (KL 0.0005-0.08 against 0.0007-0.03 and 0.0009-0.10, same top token;
+`rocm_tests/prefill_group_check.py`).
+
+| short prompts arriving together, served profile (MTP on), until all have a first token | off | **on (served)** |
+|---|---|---|
+| 3 x 2K tokens | 8.6-8.8 s | 6.6-6.7 s |
+| 5 x 1.5K tokens | 12.6-13.0 s | 9.9-10.1 s |
+
+(`rocm_tests/conc_prefill_api.py`, warm n-gram rows, four rounds per run, two runs per mode. Through the Generator
+without MTP: 1K + 2K + 3K together 8.0-9.7 -> 6.6-6.8 s.)
 
 `EXL3_PREFIX_LOG=8192` (served launcher) prints one line per started prompt of at least that many tokens: how far its
 pages match the cache, whether the first miss is changed content or an evicted page, the checkpoints below it and what
@@ -804,6 +828,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_MTP_BATCH_MIN`, `EXL3_MTP_BATCH_DRAFTS` | 0 (off), 0 (3 and 0 in the served launcher) | with at least MIN decoding jobs, MTP drafts per job (0 = none; the MTP layer still writes its K/V) |
 | `EXL3_MTP_LOOKUP_BATCH` | 0 (1 in the served launcher) | prompt lookup for jobs in a batch, in place of their MTP draft, when it pays for the padding |
 | `EXL3_GDN_REPLAY` | 0 (1 in the served launcher) | GDN rewind by replay: 2 recurrent states per slot instead of max_history + 1 |
+| `EXL3_PREFILL_GROUP`, `EXL3_PREFILL_GROUP_LOG` | 0 (1 in the served launcher), 0 | prompt chunks of several jobs that fit in one chunk run their CPU/streamed experts once over all rows (needs `greenlet`); `_LOG` prints each group |
 | `EXL3_MB_OVERLAP`, `EXL3_MB_OVERLAP_MIN` | 0 (1 in the served launcher), 3 | decode batches of at least MIN rows as two micro-batches interleaved per CPU-split MoE layer (needs `greenlet`); `seq` = same split without interleaving |
 | `EXL3_KV_STREAM_STATS`, `EXL3_KV_STREAM_VERIFY` | 0, 0 | print slot hit counters every N calls; check every streamed read against the host copy (debug, slow) |
 
@@ -835,6 +860,9 @@ verification from ~45 ms to ~14 ms per round.
 | `gdn_replay_unit.py` | GDN replay rewind vs stored history, bit-exact, at the kernel level |
 | `batch_prof.py -m <model> [--bsz 1,2,3,5]` | batched decode step breakdown: wall, host enqueue, GPU-stream time per module (the CPU collect is the wait on the worker); `EXL3_MOE_HANDOFF_PROF=1` adds the worker's compute / idle per job |
 | `graph_mem_check.py -m <model>` | VRAM growth (per-process DRM memory) per generated token with the decode graphs on; run with `EXL3_GRAPH_REINSTANTIATE=0` to see the ROCm argument-update growth |
+| `prefill_short_ab.py -m <model> [--lens ...] [--ts ...]` | short-prompt prefill time per streaming threshold (`stream_t`), interleaved in one load |
+| `prefill_group_check.py -m <model>` | grouped prefill vs separate: time until three short prompts have their first token, greedy tokens and first-token logits against the run-to-run spread |
+| `conc_prefill_api.py <url> <tag> <n> <tokens>` | n short prompts sent together through the API (n-gram rows warmed, prompt cache missed), first-token times |
 | `mb_overlap_check.py -m <model>` | micro-batch overlap vs the same split run sequentially (greedy, five jobs), against the sequential run-to-run spread; speed and extra VRAM per mode |
 | `kv_stream_unit.py` | KV streaming kernels vs a torch reference: multi-step selections, eviction pressure, invalidating writes, page copies |
 | `kv_stream_check.py -m <model> --stream 0\|1 [--out F] [--ref F]` | greedy jobs (long prompt, shared prefix, recycled pages) with streaming off / on; with `EXL3_KV_STREAM_VERIFY=1` the bit-exact read check |

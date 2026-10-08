@@ -1123,7 +1123,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         cpu_partial = None
         cpu_pending = None
         if self.cpu_split_first is not None and not params.get("autosplit_measure"):
-            cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
+            cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights, params)
 
         if self.cpu_offload:
             final_hidden_states = self.cpu_offload_forward(eshape, y, selected_experts, routing_weights, params)

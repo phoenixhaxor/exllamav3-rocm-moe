@@ -264,7 +264,7 @@ class BlockSparseMLP_CPU:
                 asn[comp] -= 1
         self.cpu_offload = False
 
-    def cpu_split_submit(self, y, bsz, selected_experts, routing_weights):
+    def cpu_split_submit(self, y, bsz, selected_experts, routing_weights, params = None):
         """Hand the tail experts' share of the routed sum to the worker. Returns
         (cpu_partial, cpu_pending): decode-size batches use the two-phase issue/collect so
         the flag waits land AFTER the caller's GPU expert work (cpu_split_combine collects);
@@ -292,6 +292,11 @@ class BlockSparseMLP_CPU:
             return None, self.cpu_host.submit_issue(
                 self.cpu_layer_idx, y, sel_cpu, routing_weights)
         sel_cpu = self._split_translate(selected_experts)
+        # Prompt chunks of several jobs read together (generator/prefill_group.py): the group runs this layer's
+        # CPU/streamed experts once over all of their rows
+        group = params.get("pf_group") if params is not None else None
+        if group is not None:
+            return group.submit(self.cpu_host, self.cpu_layer_idx, y, sel_cpu, routing_weights), None
         return self.cpu_host.submit_prefill(
             self.cpu_layer_idx, y, sel_cpu, routing_weights), None
 

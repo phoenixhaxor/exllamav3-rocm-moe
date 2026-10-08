@@ -1448,6 +1448,8 @@ class Job:
                 }
                 if self.generator.draft_model:
                     params.update(self.generator.draft_model.draft_verifier_params)
+                if self.generator._pf_group is not None:
+                    params["pf_group"] = self.generator._pf_group
                 # The next chunk's token ids (with some preceding context), predicted with the same chunking rules,
                 # so modules with host-side input staging (PLE n-gram rows) can gather them while this chunk runs.
                 # A wrong prediction only costs the staging work
