@@ -1,0 +1,34 @@
+diff --git a/common/image_util.py b/common/image_util.py
+index 9790cfe..f33f22e 100644
+--- a/common/image_util.py
++++ b/common/image_util.py
+@@ -4,7 +4,7 @@ import io
+ import re
+ 
+ from fastapi import HTTPException
+-from PIL import Image
++from PIL import Image, UnidentifiedImageError
+ 
+ from common.networking import (
+     handle_request_error,
+@@ -49,4 +49,19 @@ async def get_image(url: str) -> Image:
+ 
+                     raise HTTPException(400, error_message)
+ 
+-    return Image.open(io.BytesIO(bytes_image))
++    # A payload PIL cannot decode (not an image, or a damaged one such as a PNG
++    # without its 8-byte signature) is an input error: answer 400 with what was
++    # received instead of an unhandled 500
++    try:
++        image = Image.open(io.BytesIO(bytes_image))
++        image.load()
++    except (UnidentifiedImageError, OSError, ValueError) as exc:
++        error_message = handle_request_error(
++            f"Image input could not be decoded ({len(bytes_image)} bytes, "
++            f"starting with {bytes_image[:8].hex()}): {exc}",
++            exc_info=False,
++        ).error.message
++
++        raise HTTPException(400, error_message) from exc
++
++    return image

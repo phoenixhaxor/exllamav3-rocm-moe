@@ -131,6 +131,9 @@ providers:
 proxies and plain idle-socket timeouts from closing the connection, but clients that only count non-empty deltas as
 progress (omp does) still need the higher limit.
 
+`rocm/tabbyapi/0004-image-decode-400.patch`: an image payload PIL cannot decode (for example a PNG whose 8-byte
+signature is missing) gets HTTP 400 with its size and first bytes instead of an unhandled 500.
+
 Which to run: 262K needs no YaRN and only 12 more CPU experts per layer than 192K; take 512K only when sessions
 actually pass 262K.
 
