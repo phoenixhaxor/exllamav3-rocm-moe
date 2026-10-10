@@ -14,6 +14,7 @@ from .pagetable import PageTable, is_content_hash
 from .cpu_cache import CPUPageCache
 from .draft_confidence import DraftConfidenceCalibrator
 import os
+import faulthandler
 _presample_enable = os.environ.get("EXL3_PRESAMPLE", "1") != "0"
 _adapt_window_enable = os.environ.get("EXL3_ADAPT_WINDOW", "0") == "1"   # off: +4% prose, -3% code
 _swap_midstream = os.environ.get("EXL3_MOE_CPU_SWAP_MIDSTREAM", "1") != "0"
@@ -530,10 +531,18 @@ class Generator:
     @torch.inference_mode
     def iterate(self) -> list[dict]:
         self._iter_t0 = time.time()
+        # Backstop for the watchdog thread: a hung GPU stream can block the generator thread inside a call that
+        # holds the GIL (a pageable host-to-device copy), and then the Python thread never runs; one hang was
+        # noticed 1178 s in instead of 300. faulthandler's timer is a C thread: 30 s after the Python watchdog
+        # should have fired, it dumps every thread's stack and exits with status 1 without needing the GIL
+        if _watchdog_s > 0:
+            faulthandler.dump_traceback_later(_watchdog_s + 30, exit = True)
         try:
             return self._iterate()
         finally:
             self._iter_t0 = None
+            if _watchdog_s > 0:
+                faulthandler.cancel_dump_traceback_later()
 
 
     def _iterate(self) -> list[dict]:

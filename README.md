@@ -185,7 +185,7 @@ so ~1.5 GB less is available. Without the variable, nothing changes.
 **Served profile since 2026-10-05:** 512K (YaRN x2), `EXL3_KV_STREAM=1`, `max_batch_size: 5` (up to five requests
 decode together), `cpu_moe_split_experts: 362` with `EXL3_GDN_REPLAY=1` (380 before it: each slot beyond the first
 needed ~6 more CPU experts per layer, ~2 with replay), plus the concurrency switches below (including
-`EXL3_MB_OVERLAP=1` and `EXL3_PREFILL_GROUP=1`). The 400K needle run with
+`EXL3_MB_OVERLAP=1`). The 400K needle run with
 replay: 3/3, decode at that context 45 / 34 tok/s; at 380 without replay, prefill 350 s (1,140 tok/s) and ~9.4 GB of
 RAM still available afterwards.
 
@@ -344,7 +344,7 @@ the extra VRAM is negligible.
 | API: three code edits at once, total | 78.4-84.0 | 89.3-90.5 |
 | single requests, MTP rejoin after a batch | unchanged | unchanged |
 
-**Short prompts read together** (`EXL3_PREFILL_GROUP=1`, served launcher; needs `greenlet`). A prompt chunk streams
+**Short prompts read together** (`EXL3_PREFILL_GROUP=1`; needs `greenlet`; off in the served launcher since 2026-10-10 while two decode hangs at 200K+ contexts that followed its deployment are investigated). A prompt chunk streams
 every CPU expert that enough of its tokens route to over PCIe, so a short chunk pays a near-fixed cost: through the
 Generator (`rocm_tests/prefill_short_ab.py`, mcs 362), 1K tokens take 2.3 s, 2K 2.75 s, 4K 4.1 s and 6K 5.1 s, about
 1.7 s of fixed cost. An agent turn adds 1-6K tokens, so with several agents each turn pays it again. (The streaming
@@ -513,6 +513,10 @@ waited for work, while `/health` still answered. A generator iteration that runs
 (default 300 s; a normal one takes milliseconds to a few seconds) now dumps every thread's stack to stderr and
 exits the process, so a supervisor (systemd `Restart=always`) brings it back. The request fails instead of hanging
 forever, and the stack dump shows where it stopped.
+The watchdog thread is Python, and a hung stream can block the generator inside a call that keeps the GIL (a
+pageable host-to-device copy waits for the stream): one hang was caught after 1178 s instead of 300. A C-level
+`faulthandler` timer, armed for each iteration 30 s past the limit, is the backstop; it needs no GIL, dumps the
+stacks and exits with status 1.
 
 ## What the MoE work changed
 
@@ -831,7 +835,7 @@ verification from ~45 ms to ~14 ms per round.
 | `EXL3_MTP_BATCH_MIN`, `EXL3_MTP_BATCH_DRAFTS` | 0 (off), 0 (3 and 0 in the served launcher) | with at least MIN decoding jobs, MTP drafts per job (0 = none; the MTP layer still writes its K/V) |
 | `EXL3_MTP_LOOKUP_BATCH` | 0 (1 in the served launcher) | prompt lookup for jobs in a batch, in place of their MTP draft, when it pays for the padding |
 | `EXL3_GDN_REPLAY` | 0 (1 in the served launcher) | GDN rewind by replay: 2 recurrent states per slot instead of max_history + 1 |
-| `EXL3_PREFILL_GROUP`, `EXL3_PREFILL_GROUP_LOG` | 0 (1 in the served launcher), 0 | prompt chunks of several jobs that fit in one chunk run their CPU/streamed experts once over all rows (needs `greenlet`); `_LOG` prints each group |
+| `EXL3_PREFILL_GROUP`, `EXL3_PREFILL_GROUP_LOG` | 0, 0 | prompt chunks of several jobs that fit in one chunk run their CPU/streamed experts once over all rows (needs `greenlet`); `_LOG` prints each group |
 | `EXL3_MB_OVERLAP`, `EXL3_MB_OVERLAP_MIN` | 0 (1 in the served launcher), 3 | decode batches of at least MIN rows as two micro-batches interleaved per CPU-split MoE layer (needs `greenlet`); `seq` = same split without interleaving |
 | `EXL3_KV_STREAM_STATS`, `EXL3_KV_STREAM_VERIFY` | 0, 0 | print slot hit counters every N calls; check every streamed read against the host copy (debug, slow) |
 
