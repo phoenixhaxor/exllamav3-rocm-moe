@@ -17,16 +17,10 @@ TritonKernel::TritonKernel(py::bytes cubin, std::string _name, int _num_warps, i
     const CudaDrv& drv = CudaDrv::instance();
     cuda_check_drv(drv.module_load_data(&mod, data.data()));
     cuda_check_drv(drv.module_get_function(&fn, mod, name.c_str()));
+#if !defined(USE_ROCM)
     if (shared_bytes > 48 * 1024)
         cuda_check_drv(drv.func_set_attribute(fn, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, shared_bytes));
-}
-
-TritonKernel::TritonKernel(void* function, std::string _name, int _num_warps, int _shared_bytes) :
-    fn((CUfunction) function),
-    name(std::move(_name)),
-    num_warps(_num_warps),
-    shared_bytes(_shared_bytes)
-{
+#endif
 }
 
 TritonKernel::~TritonKernel()

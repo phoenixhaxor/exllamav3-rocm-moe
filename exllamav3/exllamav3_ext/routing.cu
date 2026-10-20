@@ -7,6 +7,9 @@
 #include "util.cuh"
 #include "reduction.cuh"
 #include "hgemm.cuh"
+#if defined(USE_ROCM)
+    #include "rocm/routing_gemv_rdna.cuh"
+#endif
 
 #define MAX_NUM_EXPERTS 512
 #define MAX_K 32
@@ -50,18 +53,18 @@ void warp_reduce_best_f32(float& key, float& payload, int& idx)
         // winner's values from the lowest tied lane
         unsigned int ku = __float_as_uint(key);
         ku = (ku & 0x80000000u) ? ~ku : (ku | 0x80000000u);
-        unsigned int m = __reduce_max_sync(EXL3_FULL_MASK, ku);
-        int src = __ffs(__ballot_sync(EXL3_FULL_MASK, ku == m)) - 1;
-        key = __shfl_sync(EXL3_FULL_MASK, key, src);
-        payload = __shfl_sync(EXL3_FULL_MASK, payload, src);
-        idx = __shfl_sync(EXL3_FULL_MASK, idx, src);
+        unsigned int m = __reduce_max_sync(0xffffffffu, ku);
+        int src = __ffs(__ballot_sync(0xffffffffu, ku == m)) - 1;
+        key = __shfl_sync(0xffffffffu, key, src);
+        payload = __shfl_sync(0xffffffffu, payload, src);
+        idx = __shfl_sync(0xffffffffu, idx, src);
     #else
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
         {
-            float other_key = __shfl_down_sync(EXL3_FULL_MASK, key, offset);
-            float other_payload = __shfl_down_sync(EXL3_FULL_MASK, payload, offset);
-            int other_idx = __shfl_down_sync(EXL3_FULL_MASK, idx, offset);
+            float other_key = __shfl_down_sync(0xffffffffu, key, offset);
+            float other_payload = __shfl_down_sync(0xffffffffu, payload, offset);
+            int other_idx = __shfl_down_sync(0xffffffffu, idx, offset);
             if (other_key > key)
             {
                 key = other_key;
@@ -70,9 +73,9 @@ void warp_reduce_best_f32(float& key, float& payload, int& idx)
             }
         }
 
-        key = __shfl_sync(EXL3_FULL_MASK, key, 0);
-        payload = __shfl_sync(EXL3_FULL_MASK, payload, 0);
-        idx = __shfl_sync(EXL3_FULL_MASK, idx, 0);
+        key = __shfl_sync(0xffffffffu, key, 0);
+        payload = __shfl_sync(0xffffffffu, payload, 0);
+        idx = __shfl_sync(0xffffffffu, idx, 0);
     #endif
 }
 
@@ -137,7 +140,7 @@ __device__ __forceinline__
 void warp_radixsort_posf16(half& key, int& idx, int* src_lane_map)
 {
     unsigned int lane_id = threadIdx.x % 32;
-    const unsigned long long active = 0xffffffffull;
+    const unsigned int active = 0xffffffffu;
 
     unsigned int ku = __half_as_ushort(key);
 
@@ -145,16 +148,16 @@ void warp_radixsort_posf16(half& key, int& idx, int* src_lane_map)
     for (int bit = 0; bit < 15; ++bit)
     {
         unsigned int b = (ku >> bit) & 1;
-        unsigned long long ones = __ballot_sync(active, b);
-        unsigned long long zeros = active ^ ones;
-        int nzeros = __popcll(zeros);
+        unsigned int ones = __ballot_sync(active, b);
+        unsigned int zeros = active ^ ones;
+        int nzeros = __popc(zeros);
 
-        unsigned long long below = (1 << lane_id) - 1;
-        int r0 = __popcll(zeros & below);
-        int r1 = __popcll(ones & below);
+        unsigned int below = (1 << lane_id) - 1;
+        int r0 = __popc(zeros & below);
+        int r1 = __popc(ones & below);
 
         int dest = b ? (nzeros + r1) : r0;
-        int myrank = __popcll(active & below);
+        int myrank = __popc(active & below);
 
         src_lane_map[dest] = lane_id;
         __syncwarp(active);
@@ -171,7 +174,7 @@ __device__ __forceinline__
 void warp_radixsort_posf32_pl(float& key, float& payload, int& idx, int* src_lane_map)
 {
     unsigned int lane_id = threadIdx.x % 32;
-    const unsigned long long active = 0xffffffffull;
+    const unsigned int active = 0xffffffffu;
 
     unsigned int ku = __float_as_uint(key);
 
@@ -179,16 +182,16 @@ void warp_radixsort_posf32_pl(float& key, float& payload, int& idx, int* src_lan
     for (int bit = 0; bit < 31; ++bit)
     {
         unsigned int b = (ku >> bit) & 1u;
-        unsigned long long ones = __ballot_sync(active, b);
-        unsigned long long zeros = active ^ ones;
-        int nzeros = __popcll(zeros);
+        unsigned int ones = __ballot_sync(active, b);
+        unsigned int zeros = active ^ ones;
+        int nzeros = __popc(zeros);
 
-        unsigned long long below = (1ull << lane_id) - 1u;
-        int r0 = __popcll(zeros & below);
-        int r1 = __popcll(ones & below);
+        unsigned int below = (1u << lane_id) - 1u;
+        int r0 = __popc(zeros & below);
+        int r1 = __popc(ones & below);
 
         int dest = b ? (nzeros + r1) : r0;
-        int myrank = __popcll(active & below);
+        int myrank = __popc(active & below);
 
         src_lane_map[dest] = lane_id;
         __syncwarp(active);
@@ -221,47 +224,20 @@ void routing_gemv_kernel
     int row = blockIdx.x * RGEMV_WARPS + warp;
     if (row >= E) return;
 
+    const half2* x2 = (const half2*) x;
+    const half2* w2 = (const half2*) (gate_t + (size_t) row * k);
+
     float sum = 0.0f;
-    #ifdef __HIP_PLATFORM_AMD__
-    if (k % 8 == 0)
+    for (int j = lane; j < k / 2; j += 32)
     {
-        // 16-byte loads, several in flight per lane: the 4-byte loop is latency-bound on gfx11
-        // (~29 us for a 512 x 2560 gate). Same per-lane fma chain order, x and w in 8-wide chunks
-        const int4* x8 = (const int4*) x;
-        const int4* w8 = (const int4*) (gate_t + (size_t) row * k);
-        #pragma unroll 5
-        for (int j = lane; j < k / 8; j += 32)
-        {
-            const int4 xv = x8[j];
-            const int4 wv = w8[j];
-            const half2* xh = (const half2*) &xv;
-            const half2* wh = (const half2*) &wv;
-            #pragma unroll
-            for (int i = 0; i < 4; ++i)
-            {
-                const float2 xf = __half22float2(xh[i]);
-                const float2 wf = __half22float2(wh[i]);
-                sum = fmaf(xf.x, wf.x, sum);
-                sum = fmaf(xf.y, wf.y, sum);
-            }
-        }
-    }
-    else
-    #endif
-    {
-        const half2* x2 = (const half2*) x;
-        const half2* w2 = (const half2*) (gate_t + (size_t) row * k);
-        for (int j = lane; j < k / 2; j += 32)
-        {
-            float2 xf = __half22float2(x2[j]);
-            float2 wf = __half22float2(w2[j]);
-            sum = fmaf(xf.x, wf.x, sum);
-            sum = fmaf(xf.y, wf.y, sum);
-        }
+        float2 xf = __half22float2(x2[j]);
+        float2 wf = __half22float2(w2[j]);
+        sum = fmaf(xf.x, wf.x, sum);
+        sum = fmaf(xf.y, wf.y, sum);
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)
-        sum += __shfl_down_sync(EXL3_FULL_MASK, sum, offset);
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
 
     if (lane == 0)
         scores[row] = __float2half_rn(sum);
@@ -280,18 +256,32 @@ void routing_gemv
 {
     // Single rows take the fixed-order FMA GEMV (exact on every architecture, and the fastest);
     // with the int8 gate available every other row count takes the deterministic int8
-    // tensor-core projection (routing_gemm.cu), so tensor-parallel ranks of any architecture
-    // routing on identical streams select identical experts. cuBLAS remains the fallback for
-    // shapes neither covers
+    // tensor-core projection (routing_gemm.cu), so tensor-parallel ranks of any sm_80+
+    // architecture routing on identical streams select identical experts (the int8 kernels
+    // need cp.async and mma.m16n8k32, both sm_80+). Pre-Ampere devices fall back to cuBLAS,
+    // which is device-dependent — uniform per-arch fleets still agree with each other
     int k = hidden.size(-1);
     int E = scores.size(-1);
+
+    // Empty hidden dim: the projection is an empty sum
+    if (k == 0) { scores.zero_(); return; }
+
     bool bsz1 = hidden.numel() == k;
+
+#if defined(USE_ROCM)
+    // RDNA: the m = 1..8 router GEMV (rocm/routing_gemv_rdna.cuh). It reads the weights once per row block, so
+    // with the deterministic projection available it only takes the smallest row counts, where it is faster;
+    // both are fixed-order and agree across devices
+    if (gate_t.has_value() && (!gate_i8.has_value() || hidden.numel() / k <= 3) &&
+        routing_gemv_rdna_try(hidden, gate_t.value(), scores, stream)) return;
+#endif
 
     if (!bsz1 && gate_i8.has_value() && gate_sb.has_value() && routing_gemm_det_fits(hidden, gate_i8.value(), gate_sb.value(), scores))
     {
         routing_gemm_det_(hidden, gate_i8.value(), gate_sb.value(), scores, stream);
     }
-    else if (bsz1 && gate_t.has_value() && !(k & 1))
+    else
+    if (bsz1 && gate_t.has_value() && !(k & 1) && !(((uintptr_t) hidden.data_ptr() | (uintptr_t) gate_t.value().data_ptr()) & 3))
     {
         routing_gemv_kernel<<<CEIL_DIVIDE(E, RGEMV_WARPS), RGEMV_WARPS * 32, 0, stream>>>
         (
@@ -410,7 +400,7 @@ __global__ void routing_ds3_nogroup_kernel
 
         float minv = v;
         for (int offset = 32 >> 1; offset > 0; offset >>= 1)
-            minv = fminf(minv, __shfl_down_sync(EXL3_FULL_MASK, minv, offset));
+            minv = fminf(minv, __shfl_down_sync(0xffffffff, minv, offset));
         if (lane_id == 0)
             reduce[warp_id] = minv;
 
@@ -420,7 +410,7 @@ __global__ void routing_ds3_nogroup_kernel
         {
             minv = lane_id < num_warps ? reduce[lane_id] : 1e30;
             for (int offset = 32 >> 1; offset > 0; offset >>= 1)
-                minv = fminf(minv, __shfl_down_sync(EXL3_FULL_MASK, minv, offset));
+                minv = fminf(minv, __shfl_down_sync(0xffffffff, minv, offset));
             if (lane_id == 0)
                 reduce[0] = minv;
         }
@@ -521,14 +511,14 @@ __global__ void routing_std_topk_kernel
     // Max logit for a stable softmax
     float max_logit = logit;
     max_logit = warp_reduce_max_f(max_logit);
-    max_logit = __shfl_sync(EXL3_FULL_MASK, max_logit, 0);
+    max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
     if (num_warps > 1)
     {
         if (lane_id == 0) max_red[warp_id] = max_logit;
         __syncthreads();
         max_logit = lane_id < num_warps ? max_red[lane_id] : -1.0e30f;
         max_logit = warp_reduce_max_f(max_logit);
-        max_logit = __shfl_sync(EXL3_FULL_MASK, max_logit, 0);
+        max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
     }
     __syncthreads();
 
@@ -586,7 +576,7 @@ __global__ void routing_std_kernel
 
     half max_logit = t < num_experts ? scores[t] : __ushort_as_half(0xfbff);
     max_logit = warp_reduce_max_h(max_logit);
-    max_logit = __shfl_sync(EXL3_FULL_MASK, max_logit, 0);
+    max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
 
     if (num_warps > 1)
     {
@@ -594,7 +584,7 @@ __global__ void routing_std_kernel
         __syncthreads();
         max_logit = lane_id < num_warps ? max_red[lane_id] : __ushort_as_half(0xfbff);
         max_logit = warp_reduce_max_h(max_logit);
-        max_logit = __shfl_sync(EXL3_FULL_MASK, max_logit, 0);
+        max_logit = __shfl_sync(0xffffffffu, max_logit, 0);
         // max_red aliases sh_v: no warp may start writing its top-K into sh_v below until every
         // warp has finished reading the reduction slots
         __syncthreads();
@@ -673,6 +663,10 @@ routed_scaling_factor: float32
 act_fn: score activation, ROUTING_ACT_SIGMOID (DS3/dots) or ROUTING_ACT_SQRTSP (DSv4)
 */
 
+#if defined(USE_ROCM)
+    #include "rocm/routing_fused_rdna.cuh"
+#endif
+
 void routing_ds3_nogroup
 (
     const at::Tensor& hidden,
@@ -690,8 +684,6 @@ void routing_ds3_nogroup
 {
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-
-    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 
     TORCH_CHECK_DTYPE(hidden, kHalf);
     TORCH_CHECK_DTYPE(gate, kHalf);
@@ -713,6 +705,18 @@ void routing_ds3_nogroup
     TORCH_CHECK(num_experts <= MAX_NUM_EXPERTS, "Too many experts");
     TORCH_CHECK(K <= MAX_K, "Too many experts per token");
     TORCH_CHECK(K <= num_experts, "K cannot exceed number of experts");
+    TORCH_CHECK(num_experts > 0, "routing_ds3_nogroup: top-k over an empty expert set");
+    TORCH_CHECK(K > 0, "routing_ds3_nogroup: K = 0 (the weights normalize over an empty selection)");
+    TORCH_CHECK(hidden.numel() == (int64_t) bsz * hidden.size(-1), "routing_ds3_nogroup: hidden and scores row counts differ");
+    if (bsz == 0) return;
+
+#if defined(USE_ROCM)
+    // RDNA: bsz 1 router GEMV + top-k in one launch (rocm/routing_fused_rdna.cuh)
+    if (routing_ds3_nogroup_fused_try(hidden, gate_t, scores, bias, topk_indices, topk_weights, scaling_factor, act_fn, stream))
+        return;
+#endif
+
+    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 
     int num_warps = CEIL_DIVIDE(num_experts, 32);
     int num_threads = num_warps * 32;
@@ -767,6 +771,8 @@ void routing_ds3_nogroup_logits
     TORCH_CHECK(num_experts <= MAX_NUM_EXPERTS, "Too many experts");
     TORCH_CHECK(K <= MAX_K, "Too many experts per token");
     TORCH_CHECK(K <= num_experts, "K cannot exceed number of experts");
+    TORCH_CHECK(num_experts > 0, "routing_ds3_nogroup_logits: top-k over an empty expert set");
+    TORCH_CHECK(K > 0, "routing_ds3_nogroup_logits: K = 0 (the weights normalize over an empty selection)");
 
     int num_warps = CEIL_DIVIDE(num_experts, 32);
     int num_threads = num_warps * 32;
@@ -774,6 +780,7 @@ void routing_ds3_nogroup_logits
     // The radix-sort variant merges K of every 32 candidates per stage, which stops converging
     // past K = 16 (the iterative kernel is the one the model paths use)
     TORCH_CHECK(use_topk || K <= 16, "routing_ds3_nogroup_logits: radix-sort kernel supports K <= 16");
+    if (bsz == 0) return;
     if (use_topk)
     {
         size_t shmem = num_experts * 2 * sizeof(float);
@@ -873,6 +880,7 @@ void moe_split_map
     TORCH_CHECK_DTYPE(sel_cpu, kLong);
     int n = (int) sel.numel();
     TORCH_CHECK(sel_cpu.numel() >= n, "moe_split_map: sel_cpu too small");
+    if (n == 0) return;
     int threads = n < 1024 ? n : 1024;
     int blocks = (n + threads - 1) / threads;
     moe_split_map_kernel<<<blocks, threads, 0, stream>>>
@@ -1056,9 +1064,14 @@ void moe_split_issue
     TORCH_CHECK(y.is_contiguous() && w.is_contiguous() && sel.is_contiguous(),
                 "moe_split_issue: inputs must be contiguous");
     TORCH_CHECK(map.has_value() == hist.has_value(), "moe_split_issue: map requires hist");
+    TORCH_CHECK_DTYPE_OPT(map, kLong);
+    TORCH_CHECK_DTYPE_OPT(hist, kFloat);
+    TORCH_CHECK_DIM(y, 2);
     int n = (int) sel.numel();
     int rows = (int) y.size(0);
     int h_ = (int) y.size(1);
+    TORCH_CHECK(w.numel() == n && (rows ? n % rows == 0 : n == 0), "moe_split_issue: sel and w must hold rows * topk entries");
+    // n = 0 still launches: the slot's dev_count must read 0 so collect skips the stale slot
     moe_split_issue_kernel<<<1, 1024, 0, stream>>>
     (
         (int64_t*) sel.data_ptr(),
@@ -1118,6 +1131,7 @@ void moe_split_collect_add
     int rows = (int) final_out.size(0);
     int h_ = (int) final_out.size(1);
     int total = rows * h_;
+    if (total == 0) return;
     int threads = total < 1024 ? total : 1024;
     int blocks = (total + threads - 1) / threads;
     moe_split_collect_add_kernel<<<blocks, threads, 0, stream>>>
@@ -1176,8 +1190,6 @@ void routing_sel_norm
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
-
     TORCH_CHECK_DTYPE(hidden, kHalf);
     TORCH_CHECK_DTYPE(gate, kHalf);
     TORCH_CHECK_DTYPE(scores, kHalf);
@@ -1193,6 +1205,12 @@ void routing_sel_norm
     int num_experts = scores.size(1);
     int K = selected.size(1);
     TORCH_CHECK(K <= 32, "routing_sel_norm: K > 32");
+    TORCH_CHECK(num_experts > 0, "routing_sel_norm: empty expert set");
+    TORCH_CHECK(K > 0, "routing_sel_norm: K = 0 (the weights normalize over an empty selection)");
+    TORCH_CHECK(hidden.numel() == (int64_t) bsz * hidden.size(-1), "routing_sel_norm: hidden and scores row counts differ");
+    if (bsz == 0) return;
+
+    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 
     routing_sel_norm_kernel<<<bsz, 32, 0, stream>>>
     (
@@ -1234,8 +1252,6 @@ void routing_std
     const at::cuda::OptionalCUDAGuard device_guard(scores.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
-    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
-
     TORCH_CHECK_DTYPE(hidden, kHalf);
     TORCH_CHECK_DTYPE(gate, kHalf);
     TORCH_CHECK_SHAPES(scores, 0, topk_indices, 0, 1);
@@ -1256,12 +1272,19 @@ void routing_std
     TORCH_CHECK(num_experts <= MAX_NUM_EXPERTS, "Too many experts");
     TORCH_CHECK(K <= MAX_K, "Too many experts per token");
     TORCH_CHECK(K <= num_experts, "K cannot exceed number of experts");
+    TORCH_CHECK_DTYPE_OPT(bias, kHalf);
+    TORCH_CHECK_SHAPES_OPT(bias, 0, scores, 1, 1);
+    TORCH_CHECK(num_experts > 0, "routing_std: top-k over an empty expert set");
+    TORCH_CHECK(K > 0, "routing_std: K = 0 (the weights normalize over an empty selection)");
+    TORCH_CHECK(hidden.numel() == (int64_t) bsz * hidden.size(-1), "routing_std: hidden and scores row counts differ");
+    if (bsz == 0) return;
+
+    routing_gemv(hidden, gate, gate_t, gate_i8, gate_sb, scores, stream);
 
     int num_warps = CEIL_DIVIDE(num_experts, 32);
     int num_threads = num_warps * 32;
     size_t shmem = (num_experts + num_warps) * sizeof(float);
 
-    TORCH_CHECK_DTYPE_OPT(bias, kHalf);
     routing_std_topk_kernel<<<bsz, num_threads, shmem, stream>>>
     (
         (const half*) scores.data_ptr(),
@@ -1305,11 +1328,14 @@ void routing_std_logits
     TORCH_CHECK(num_experts <= MAX_NUM_EXPERTS, "Too many experts");
     TORCH_CHECK(K <= MAX_K, "Too many experts per token");
     TORCH_CHECK(K <= num_experts, "K cannot exceed number of experts");
+    TORCH_CHECK(num_experts > 0, "routing_std_logits: top-k over an empty expert set");
+    TORCH_CHECK(K > 0, "routing_std_logits: K = 0 (the weights normalize over an empty selection)");
 
     int num_warps = CEIL_DIVIDE(num_experts, 32);
     int num_threads = num_warps * 32;
 
     TORCH_CHECK(use_topk || K <= 16, "routing_std_logits: radix-sort kernel supports K <= 16");
+    if (bsz == 0) return;
     if (use_topk)
     {
         size_t shmem = (num_experts + num_warps) * sizeof(float);

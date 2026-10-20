@@ -46,7 +46,7 @@ void cuda_recurrent_gated_delta_rule
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
-    const c10::optional<at::Tensor>& replay
+    const c10::optional<at::Tensor>& slots_in = c10::nullopt
 );
 
 void cuda_recurrent_gated_delta_rule_gr
@@ -62,7 +62,7 @@ void cuda_recurrent_gated_delta_rule_gr
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
-    const c10::optional<at::Tensor>& replay,
+    const c10::optional<at::Tensor>& slots_in,
     Graph* graph
 );
 
@@ -111,7 +111,8 @@ void cuda_recurrent_mamba2
     int k_head_dim,
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
-    bool history
+    bool history,
+    const c10::optional<at::Tensor>& slots_in = c10::nullopt
 );
 
 void cuda_recurrent_mamba2_gr
@@ -128,6 +129,7 @@ void cuda_recurrent_mamba2_gr
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
+    const c10::optional<at::Tensor>& slots_in,
     Graph* graph
 );
 
@@ -140,7 +142,8 @@ void cuda_causal_conv1d_update
     const c10::optional<at::Tensor>& bias,
     at::Tensor& out,
     bool activation,
-    bool history
+    bool history,
+    bool incremental = false
 );
 
 void cuda_causal_conv1d_update_gr
@@ -153,7 +156,8 @@ void cuda_causal_conv1d_update_gr
     at::Tensor& out,
     bool activation,
     bool history,
-    Graph* graph
+    Graph* graph,
+    bool incremental = false
 );
 
 // Split-projection (Qwen3.5) helper: cast/transpose qkv to bf16 mixed_qkv and compute beta/g from
@@ -234,69 +238,41 @@ struct ConvRewindJob
         src(_src), dst(_dst), dim(_dim), cdim(_cdim), stride(_stride) {}
 };
 
-// recurrent_state rewind: recurrent_state[slot, 0] <- recurrent_state[slot, last_history+1-num_tokens].
-// Flat fp32 copy of num_elements contiguous elements; src/dst never overlap (num_tokens >= 1
-// forces the source history index to differ from destination index 0).
-struct StateRewindJob
+// Recurrent-state replay (the state half of a rewind): rerun the sequential scan over the first
+// `prefix` staged tokens of one batch row of the last speculative pass, from the base row into
+// the scratch row of the layer's state pool. The scan kernel is the one the pass ran, over the
+// same staged inputs and the same initial state, so the result is the state that pass had after
+// `prefix` tokens. One job per recurrent layer; a launch carries the jobs of every layer that
+// shares the kernel geometry (all layers of a model), so a rewind is one launch per device.
+struct ScanReplayJob
 {
-    uintptr_t src;
-    uintptr_t dst;
-    int64_t num_elements;
+    uintptr_t qkv;          // staged post-conv qkv rows of this batch row, [prefix, qkv_dim] bf16
+    uintptr_t g;            // staged log decay, [prefix, heads] or [prefix, heads, dk] (KDA) fp32
+    uintptr_t beta;         // staged beta / dt, [prefix, heads] bf16
+    uintptr_t base;         // state row read for the first token, fp32 or fp16 [heads, dk, dv]
+    uintptr_t scratch;      // state row written (first token from base, then in place)
+    uintptr_t D;            // Mamba2 skip scales [heads] fp32, else 0
+    int prefix;
+    int tstride;            // staged rows between consecutive tokens: 1 for a pass staged (row, token),
+                            // the batch size for one staged token-major, one step at a time
 
-    StateRewindJob() = default;
-    StateRewindJob(uintptr_t _src, uintptr_t _dst, int64_t _num_elements) :
-        src(_src), dst(_dst), num_elements(_num_elements) {}
-};
-
-// Replay rewind (EXL3_GDN_REPLAY): state points at recurrent_state[slot, 0] (the snapshot is the next state), replay
-// at the slot's first replay row; the state becomes the snapshot advanced through `accepted` tokens
-struct StateReplayJob
-{
-    uintptr_t state;
-    uintptr_t replay;
-    int accepted;
-    int num_k_heads;
-    int num_v_heads;
-    int tok_bytes;
-
-    StateReplayJob() = default;
-    StateReplayJob(uintptr_t _state, uintptr_t _replay, int _accepted, int _nk, int _nv, int _tok_bytes) :
-        state(_state), replay(_replay), accepted(_accepted), num_k_heads(_nk), num_v_heads(_nv), tok_bytes(_tok_bytes) {}
+    ScanReplayJob() = default;
+    ScanReplayJob(uintptr_t _qkv, uintptr_t _g, uintptr_t _beta, uintptr_t _base, uintptr_t _scratch,
+                  uintptr_t _D, int _prefix, int _tstride = 1) :
+        qkv(_qkv), g(_g), beta(_beta), base(_base), scratch(_scratch), D(_D), prefix(_prefix), tstride(_tstride) {}
 };
 
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
-void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_index);
-void batched_state_replay(std::vector<StateReplayJob> const& jobs, int device_index);
 
-bool gdn_core_mk
+// kind: 0 = gated delta rule, 1 = Mamba2, 2 = KDA (channelwise decay; requires 128x128 heads)
+void batched_scan_replay
 (
-    const at::Tensor& x,
-    const at::Tensor& ba_w_t,
-    const c10::optional<at::Tensor>& ba_bias,
-    at::Tensor& ba,
-    const at::Tensor& qkv,
-    at::Tensor& conv_state,
-    const at::Tensor& slots,
-    const at::Tensor& conv_w,
-    const c10::optional<at::Tensor>& conv_b,
-    at::Tensor& conv_out,
-    const at::Tensor& dt_bias,
-    const at::Tensor& a_log,
-    float beta_scale,
-    at::Tensor& recurrent_state,
-    at::Tensor& core_attn_out,
+    std::vector<ScanReplayJob> const& jobs,
+    int device_index,
+    int kind,
     int num_k_heads,
     int num_v_heads,
     int k_head_dim,
     int v_head_dim,
-    bool history,
-    const c10::optional<at::Tensor>& replay,
-    const c10::optional<at::Tensor>& o_suh,
-    const c10::optional<at::Tensor>& gn_w,
-    const c10::optional<at::Tensor>& gn_g,
-    float gn_eps,
-    float gn_bias,
-    bool gn_sigmoid
+    bool state_half = false     // the jobs' state rows hold fp16 elements (see state_ld in gdn.cu)
 );
-
-void gdn_mk_set(int enable);

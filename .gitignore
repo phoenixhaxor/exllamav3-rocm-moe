@@ -11,12 +11,10 @@ dist
 # produced by `pip install -e .`
 exllamav3_ext.cpython-*.so
 
-# ROCm build: hipify output and extension builds
-*.hip
-*_hip.cuh
-*_hip.cpp
-*_hip.h
-exllamav3/exllamav3_ext/hip_drv.*
-exllamav3/exllamav3_ext/hip_host.*
-*.so
-build/
+# written next to the sources by torch's hipify during ROCm builds
+exllamav3/exllamav3_ext/**/*.hip
+exllamav3/exllamav3_ext/**/*_hip.*
+exllamav3/exllamav3_ext/**/hip_*
+
+# per-machine test model registry overrides (tests/testlib/models.py)
+tests/models.local.yaml

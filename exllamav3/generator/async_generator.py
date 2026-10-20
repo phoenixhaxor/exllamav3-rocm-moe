@@ -28,6 +28,7 @@ class AsyncGenerator:
         self.condition = asyncio.Condition()
         self.threaded = _async_thread
         self._calls = collections.deque()
+        self._rejected = collections.deque()    # (AsyncJob, exception): enqueues the worker thread refused
         self._executor = concurrent.futures.ThreadPoolExecutor(1, "exl3-generator") if self.threaded else None
         self.iteration_task = asyncio.create_task(self._run_iteration())
 
@@ -52,8 +53,21 @@ class AsyncGenerator:
                 # is notified by enqueue() or close(), so this background task does not spin between requests.
                 async with self.condition:
                     # Wake when the first job arrives or when close() has cancelled the iteration task.
-                    await self.condition.wait_for(
-                        lambda: len(self.jobs) > 0 or len(self._calls) > 0 or self.iteration_task.cancelled())
+                    # While idle, continue the disk flush in steps (Generator.idle_work). Each step is short, so a
+                    # new job waits for at most one step. Queued loop-side calls (threaded mode) also end the wait,
+                    # so a cancel or a rejected enqueue is applied without a job being active
+                    def _has_work():
+                        return len(self.jobs) > 0 or len(self._calls) > 0 or self.iteration_task.cancelled()
+                    while not _has_work():
+                        if self.generator.has_idle_work():
+                            try:
+                                await asyncio.wait_for(self.condition.wait(), timeout = 0.25)
+                            except asyncio.TimeoutError:
+                                pass
+                            if not self.jobs and not self._calls:
+                                self.generator.idle_work()
+                        else:
+                            await self.condition.wait()
 
                 # Drive exactly one synchronous generator step and fan out any returned events to the owning
                 # AsyncJob queues. Missing jobs can happen if a job was cancelled after iterate() started.
@@ -64,6 +78,7 @@ class AsyncGenerator:
                     results = await asyncio.get_running_loop().run_in_executor(self._executor, self._step)
                 else:
                     results = self.generator.iterate()
+                self._deliver_rejected()
                 self.deliver_results(results)
 
                 # Yield back to the event loop so result consumers and cancellation requests can run between
@@ -79,9 +94,21 @@ class AsyncGenerator:
             # them. The iteration task ends here and the generator is unusable, so record the error and deliver
             # it to any job enqueued later as well, instead of letting those jobs wait forever on a dead loop.
             self.error = e
+            # The cache contents are not known to be correct now: the disk tier must not keep them
+            disk = getattr(self.generator, "disk_page_cache", None)
+            if disk is not None:
+                disk.abort()
             for async_job in self.jobs.values():
                 async_job.put_result(e)
             self.jobs.clear()
+
+    def _deliver_rejected(self):
+        """Loop-thread side of a refused enqueue (threaded mode): untrack the job, hand its consumer the exception"""
+        while self._rejected:
+            job, e = self._rejected.popleft()
+            if self.jobs.get(job.job) is job:
+                del self.jobs[job.job]
+                job.put_result(e)
 
     def deliver_results(self, results):
         """
@@ -117,7 +144,23 @@ class AsyncGenerator:
         # land in. The sync generator still owns scheduling and serial assignment.
         assert job.job not in self.jobs
         self.jobs[job.job] = job
-        self._call(lambda: self.generator.enqueue(job.job))
+        if self.threaded:
+            # Applied by the worker thread before its next step; a rejection (e.g. a prompt too long for the cache)
+            # is handed back to the loop thread, which untracks the job and delivers the exception to its consumer
+            def _enqueue_in_worker():
+                try:
+                    self.generator.enqueue(job.job)
+                except Exception as e:
+                    self._rejected.append((job, e))
+            self._calls.append(_enqueue_in_worker)
+        else:
+            try:
+                self.generator.enqueue(job.job)
+            except Exception:
+                # A rejected job (e.g. too long for the cache) must not stay tracked: it would never produce a
+                # result, and a non-empty job map keeps the iteration loop spinning instead of idling
+                del self.jobs[job.job]
+                raise
 
         # Condition.notify_all() must run while holding the condition lock, so schedule a tiny coroutine instead of
         # trying to notify directly from this synchronous method.
@@ -145,9 +188,9 @@ class AsyncGenerator:
         if self._executor is not None:
             self._executor.shutdown(wait = True)
 
-        cpu_cache = getattr(self.generator, "cpu_page_cache", None)
-        if cpu_cache is not None:
-            cpu_cache.close()
+        # Release what the sync generator holds on the host (recurrent checkpoints, the CPU page cache
+        # tier, pinned buffers) now: the failed jobs and their tracebacks can keep it reachable for a while
+        self.generator.close()
 
     async def cancel(self, job: AsyncJob):
         # Remove the underlying Job from the synchronous generator first so no new tokens are produced, then drop
@@ -210,6 +253,26 @@ class AsyncJob:
         shared iteration task but still queued for this consumer precede the injection in the stream.
         """
         self.generator._call(lambda: self.job.constrain_output_now(output))
+
+    def set_sampler(self, sampler):
+        """
+        Replace the sampler mid-generation; see Job.set_sampler. Safe to call from any coroutine on the
+        generator's event loop, including the body of an `async for` over this job. Results already queued
+        for this consumer were sampled before the change.
+        """
+        self.job.set_sampler(sampler)
+
+    def set_filters(self, filters):
+        """
+        Replace the filters mid-generation; see Job.set_filters and set_sampler above.
+        """
+        self.job.set_filters(filters)
+
+    def set_banned_strings(self, banned_strings):
+        """
+        Replace the banned strings mid-generation; see Job.set_banned_strings and set_sampler above.
+        """
+        self.job.set_banned_strings(banned_strings)
 
     async def cancel(self):
         # Delegate cancellation to the wrapper so it can update both the sync generator queue and the async job map,

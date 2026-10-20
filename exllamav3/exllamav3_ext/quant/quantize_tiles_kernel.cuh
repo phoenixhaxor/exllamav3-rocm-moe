@@ -14,6 +14,14 @@
 #include "../util.cuh"
 #include "codebook.cuh"
 
+// Smallest K whose two cost arrays (2 * (65536 >> K) halves) are kept in shared memory; below it they live in
+// the caller's global scratch. RDNA's 64 KB of LDS per workgroup cannot hold K = 2's arrays next to the tile
+#if defined(USE_ROCM)
+    #define QT_SHARED_COSTS_MIN_K 3
+#else
+    #define QT_SHARED_COSTS_MIN_K 2
+#endif
+
 #ifndef H_INF
 #define H_INF __ushort_as_half(0x7c00)
 #endif
@@ -44,11 +52,11 @@ __host__ __device__ constexpr int qt_min_blocks(int K, int arch)
 __device__ __forceinline__ uint32_t qt_warp_min(uint32_t value)
 {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    return __reduce_min_sync(EXL3_FULL_MASK, value);
+    return __reduce_min_sync(0xffffffff, value);
 #else
     #pragma unroll
     for (int offset = 16; offset; offset >>= 1)
-        value = min(value, __shfl_xor_sync(EXL3_FULL_MASK, value, offset));
+        value = min(value, __shfl_xor_sync(0xffffffff, value, offset));
     return value;
 #endif
 }
@@ -79,14 +87,14 @@ void quantize_tiles_kernel
     const float* input_tile = input_tiles_ptr + L * tile_idx;
     float* output_tile = output_tiles_ptr + L * tile_idx;
     uint16_t* output_indices = output_indices_ptr + L * tile_idx;
-    uint16_t* temp_edges = temp_edges_ptr + L * edges * tile_idx;
+    uint16_t* temp_edges = temp_edges_ptr + (size_t) L * edges * tile_idx;
 
     half* sh_input_tile = (half*) sh; sh += L * sizeof(half);
     half* sh_min = (half*) sh; sh += 32 * sizeof(half);
     int* sh_idx = (int*) sh; sh += 32 * sizeof(int);
 
     half* sh_temp_costs = (half*) sh;
-    half* temp_costs = K >= 2 ? sh_temp_costs : temp_costs_ptr + 2 * edges * tile_idx;
+    half* temp_costs = K >= QT_SHARED_COSTS_MIN_K ? sh_temp_costs : temp_costs_ptr + (size_t) 2 * edges * tile_idx;
     half* temp_costs_inc = temp_costs + edges;
 
     for (int i = thread; i < L; i += NT) sh_input_tile[i] = __float2half_rn(input_tile[i]);

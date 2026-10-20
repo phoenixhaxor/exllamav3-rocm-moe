@@ -60,7 +60,8 @@ def _grouped_dynamic_convolve(
     [b, l, H]), is added into residual in place and residual is returned (the finish()
     variant's residual add, fused into the kernel).
     """
-    if not hidden.is_cuda:
+    # TODO: HIP version
+    if not hidden.is_cuda or not ext.HAS_DFLASH2:
         return _grouped_dynamic_convolve_torch(hidden, dynamic, base, group_size, residual)
     hidden = hidden.contiguous()
     if residual is not None:
@@ -281,10 +282,18 @@ class DFlash2Selector(Module):
     @override
     def load(self, device: torch.device, **kwargs):
         super().load(device, **kwargs)
+        # Older trainers append .weight to the bare codebook keys;
+        # try bare first, fall back to suffixed (same bytes either way).
         self.pred_codebook = self.config.stc.get_tensor(
-            self.key_pred, self.device, optional = False, allow_bf16 = True)
+            self.key_pred, self.device, optional = True, allow_bf16 = True)
+        if self.pred_codebook is None:
+            self.pred_codebook = self.config.stc.get_tensor(
+                self.key_pred + ".weight", self.device, optional = False, allow_bf16 = True)
         self.succ_codebook = self.config.stc.get_tensor(
-            self.key_succ, self.device, optional = False, allow_bf16 = True)
+            self.key_succ, self.device, optional = True, allow_bf16 = True)
+        if self.succ_codebook is None:
+            self.succ_codebook = self.config.stc.get_tensor(
+                self.key_succ + ".weight", self.device, optional = False, allow_bf16 = True)
         expected_shape = (self.vocab_size, self.rank)
         if self.pred_codebook.shape != expected_shape:
             raise ValueError(
@@ -342,10 +351,12 @@ class DFlash2Selector(Module):
         and the whole chain run as two kernels (no per-row host round trip, no torch
         intermediates)."""
         vocab_size = vocab_size or logits.shape[-1]
-        gate = self.hidden_proj.forward(hidden.half(), params = {})
+        # The generator passes state[:, 1:], a strided view for more than one row, and .half() on
+        # an fp16 state returns that view as is
+        gate = self.hidden_proj.forward(hidden.half().contiguous(), params = {})
         anchor_ids = anchor_ids.long()
         bsz, rows = logits.shape[:2]
-        cuda = hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16)
+        cuda = ext.HAS_DFLASH2 and hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16)
         if cuda and self.top_k in (8, 16, 32) and logits.stride(-1) == 1:
             unary = torch.empty((bsz, rows, self.top_k), dtype = torch.float, device = hidden.device)
             cands = torch.empty((bsz, rows, self.top_k), dtype = torch.long, device = hidden.device)
@@ -355,6 +366,27 @@ class DFlash2Selector(Module):
             if softcap > 0.0:
                 logits = torch.tanh(logits / softcap) * softcap
             unary, cands = torch.topk(logits, self.top_k, dim = -1, sorted = False)
+        return self._walk(hidden, gate, unary, cands, anchor_ids, return_confidence, cuda)
+
+
+    def walk_candidates(
+        self,
+        hidden: torch.Tensor,
+        unary: torch.Tensor,
+        cands: torch.Tensor,
+        anchor_ids: torch.Tensor,
+        return_confidence: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """walk_block from candidates already selected: unary [b, rows, top_k] scores (scaled and
+        softcapped as walk_block would) and cands [b, rows, top_k] vocabulary ids. The tensor-parallel
+        target computes these per shard and merges them, so no full-width logits ever leave the ranks."""
+        gate = self.hidden_proj.forward(hidden.half().contiguous(), params = {})
+        cuda = ext.HAS_DFLASH2 and hidden.is_cuda and self.pred_codebook.dtype in (torch.half, torch.bfloat16)
+        return self._walk(hidden, gate, unary, cands, anchor_ids.long(), return_confidence, cuda)
+
+
+    def _walk(self, hidden, gate, unary, cands, anchor_ids, return_confidence, cuda):
+        bsz, rows = unary.shape[:2]
         if cuda:
             out = torch.empty((bsz, rows + 1), dtype = torch.long, device = hidden.device)
             conf = torch.empty((bsz, rows + 1), dtype = torch.float, device = hidden.device) if return_confidence else None

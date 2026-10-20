@@ -4,16 +4,18 @@ import os
 import torch
 import torch.nn.functional as F
 from ..model.config import Config
+from ..util.device_copy import host_to_device
 from ..util.tensor import to2
 from . import Module, Linear
 from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
+from ..util.backend import MOE_FUSED_ROWS, MOE_BATCH_RECON, MOE_MTILE
 from dataclasses import dataclass
-from .mlp import MLP, GatedMLP
+from .mlp import MLP, GatedMLP, capture_out_sensitivity
 from .rmsnorm import RMSNorm
 from .layernorm import LayerNorm
 from .block_sparse_mlp_cpu import BlockSparseMLP_CPU
-from .moe_batch_recon import PAD_MAX
+from .moe_batch_recon import PAD_MAX, worst_case_bytes
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
 from ..util.tensor import g_tensor_cache, buffered_interleaved_arange
@@ -23,17 +25,18 @@ from .block_sparse_mlp_routing import (
 )
 
 # Row capacity of the fused MoE kernel's per-group temp buffers (experts with more assigned
-# rows take the reconstruct paths); EXL3_MOE_FUSED_ROWS overrides for tuning sweeps
-TEMP_ROWS_FUSED = int(os.environ.get("EXL3_MOE_FUSED_ROWS", 128))
+# rows take the reconstruct paths); EXL3_MOE_FUSED_ROWS overrides for tuning sweeps (per-backend
+# defaults in util/backend.py)
+TEMP_ROWS_FUSED = MOE_FUSED_ROWS
 TEMP_ROWS_GRAPH = 32
 # Batched reconstruct tier for the experts above the fused kernel's row capacity at prefill
 # (moe_batch_recon.py); EXL3_MOE_BATCH_RECON=0 restores the per-expert reconstruct loop
-BATCH_RECON = os.environ.get("EXL3_MOE_BATCH_RECON", "1") != "0"
+BATCH_RECON = MOE_BATCH_RECON
 # Row tiles for the fused kernel: experts with more than MTILE_T1 rows run through a 32-row tile
 # instance, more than MTILE_T2 through a 64-row one (32 for the N = 256 shape), each its own
 # launch over its expert range (mul1 codebook only). EXL3_MOE_MTILE=0 keeps the single 16-row
 # launch
-MTILE = os.environ.get("EXL3_MOE_MTILE", "1") != "0"
+MTILE = MOE_MTILE
 MTILE_T1, MTILE_T2 = 16, 32
 # Fused-kernel row capacity per expert when the wide tiles apply: with them the fused kernel
 # beats the batched reconstruct tier up to 256 rows (Qwen3.8 4k chunk: 128 -> 256 rows +3%)
@@ -70,14 +73,6 @@ _routing_check = os.environ.get("EXL3_TP_ROUTING_CHECK", "0") != "0"
 # Shared expert as a one-expert fused decode launch (see BC_BlockSparseMLP::sh_coop); 0 keeps the
 # three-launch BC_GatedMLP graph
 _moe_shared_coop = os.environ.get("EXL3_MOE_SHARED_COOP", "1") != "0"
-# EXL3_MOE_BSZN=0 disables the fused decode kernels (BC_BlockSparseMLP.run_bszN), for A/B tests
-_bszn_enable = os.environ.get("EXL3_MOE_BSZN", "1") != "0"
-# RDNA3: routed experts of decode-sized batches through exl3_rdna3_moe_decode (two matmul launches per
-# layer, no host sync); EXL3_RDNA3_MOE=0 falls back to the generic paths
-_rdna3_moe_enable = bool(torch.version.hip) and os.environ.get("EXL3_RDNA3_MOE", "1") != "0"
-RDNA3_MOE_MAX_TOKENS = 16
-# EXL3_RDNA3_MOE_SHARED=0 keeps the shared expert on its own GatedMLP path
-_rdna3_moe_shared = os.environ.get("EXL3_RDNA3_MOE_SHARED", "1") != "0"
 
 # Router types whose selection runs entirely on the deterministic ext paths (routing_gemm.cu +
 # fixed-order top-k with FMA-only activations), so under tensor parallelism every rank can route
@@ -117,6 +112,20 @@ def _routing_check_compare(key, local_sel, local_w, sel, w):
         lw = torch.gather(local_w, 1, torch.sort(local_sel, dim = 1).indices)[same]
         bw = torch.gather(w, 1, torch.sort(sel, dim = 1).indices)[same]
         st["w_maxdiff"] = max(st["w_maxdiff"], float((lw.float() - bw.float()).abs().max().item()))
+
+
+class MoETPAllocation(TPAllocation):
+    """MoE prefill scratch scales with the routed rows a rank receives, not linearly with its share
+    of experts (see BlockSparseMLP.tp_prefill_bound)"""
+
+    def __init__(self, module: BlockSparseMLP, tensor_split: bool, **kwargs):
+        super().__init__(**kwargs)
+        self.module = module
+        self.tensor_split = tensor_split
+
+    def overhead(self, tokens: int, s: int, channels: int) -> int:
+        return super().overhead(tokens, s, channels) + \
+            self.module.tp_prefill_bound(tokens, s, channels, self.tensor_split)
 
 
 class BlockSparseMLP(BlockSparseMLP_CPU, Module):
@@ -554,10 +563,6 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 cbs[0] == cbs[1] == cbs[2] and cbs[0] in ((True, False), (False, True)) and
                 self.support_quant_paths
             )
-            # exl3_moe (the fused prefill kernel) needs 90 KB of dynamic shared memory and
-            # mma.sync; gfx11 has 64 KB per workgroup, so ROCm takes the reconstruct tiers
-            if torch.version.hip:
-                self.support_fused = False
 
         # Temp buffers for graph, dq and fused-bsz1 paths
         numex = self.num_experts_per_tok
@@ -750,15 +755,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
     def load_routing(self, **kwargs):
 
+        per_expert_scale = self.per_expert_scale
         if self.interm_div != 1.0 and self.router_type == "std":
             # std routing has no scaling factor; fold the interm_div compensation into the
             # per-expert scale, which routing_std applies after top-k normalization. Both the
-            # GPU and CPU-offload load paths come through here, and unload clears the tensor
-            if self.per_expert_scale is None:
-                self.per_expert_scale = torch.full(
+            # GPU and CPU-offload load paths come through here. The folded scale only goes to the
+            # routing config: self.per_expert_scale stays the checkpoint tensor, which is what
+            # get_tensors and the TP export hand on
+            if per_expert_scale is None:
+                per_expert_scale = torch.full(
                     (self.num_experts,), self.interm_div, dtype = torch.bfloat16, device = self.device)
             else:
-                self.per_expert_scale = (self.per_expert_scale.float() * self.interm_div).to(torch.bfloat16)
+                per_expert_scale = (per_expert_scale.float() * self.interm_div).to(torch.bfloat16)
 
         router_logits_bsz1 = torch.empty((1, self.num_experts), dtype = torch.half, device = self.device)
         routing_weights_bsz1 = torch.empty((1, self.num_experts_per_tok), dtype = torch.half, device = self.device)
@@ -780,7 +788,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             routed_scaling_factor = self.routed_scaling_factor,
             n_group = self.n_group,
             topk_group = self.topk_group,
-            per_expert_scale = self.per_expert_scale,
+            per_expert_scale = per_expert_scale,
         )
 
 
@@ -877,28 +885,51 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.cpu_offload or self.multi_up is None:
             return 0, 0
         h = self.expert_size
+        recon = self._batch_recon_layer(torch.empty((1, h), dtype = torch.half, device = self.device))
+        recon_dims = (recon.dims_g, recon.dims_u, recon.dims_d, recon.interm_fp32) if recon is not None else None
+        return self._prefill_bound(rows, assignments, self.intermediate_size_padded, recon_dims)
+
+    def _prefill_bound(self, rows: int, assignments: int, interm: int, recon_dims: tuple | None) -> tuple[int, int]:
+        """Shape-only core of prefill_worst_case_parts: `interm` is the (padded) intermediate width
+        of the local experts and recon_dims the batched tier's (dims_g, dims_u, dims_d, interm_fp32),
+        or None if the layer has no batched tier"""
+        h = self.expert_size
         fixed = (rows + 1) * h * 4 + rows * h * 2
         if FUSED_DET:
             fixed += (int(assignments * PAD_MAX) + 1) * h * 4
         r = min(rows, assignments)
         isz = (self.interm_dtype or torch.float).itemsize
-        per_expert = r * (2 * self.intermediate_size_padded * isz + 2 * h * 2 + h * 4)
+        per_expert = r * (2 * interm * isz + 2 * h * 2 + h * 4)
         if self.interm_dtype != torch.half:
-            per_expert += r * self.intermediate_size_padded * 2
-        recon = self._batch_recon_layer(torch.empty((1, h), dtype = torch.half, device = self.device))
-        batched = recon.worst_case_bytes(assignments, slot_mode = FUSED_DET) if recon is not None else 0
+            per_expert += r * interm * 2
+        batched = worst_case_bytes(*recon_dims, assignments, slot_mode = FUSED_DET) if recon_dims is not None else 0
         return fixed, max(per_expert, batched)
+
+    def autosplit_prepare(self, params):
+        """Autosplit loader hook, before the measuring window: the worst-case computation below
+        creates the CPU-offload host's per-device stream state and this layer's tier tables as
+        a side effect, so running it here makes them resident memory rather than transient"""
+        if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
+            return
+        rows = (params.get("batch_shape") or (1, 0))[1]
+        if rows and self.device is not None and self.device.type == "cuda":
+            self._autosplit_worst_case(rows)
 
     def autosplit_extra_measure(self, params):
         """Autosplit loader hook: allocate (and drop) the worst-case prefill transient so the
-        device keeps headroom for it. The CPU-offload host's per-device stream state and this
-        layer's tier statics are allocated for real here: the measuring forward skips the CPU
-        path, and they would otherwise appear unaccounted on the first real prefill"""
+        device keeps headroom for it (the measuring forward skips the CPU path)"""
         if os.environ.get("EXL3_AUTOSPLIT_WORSTCASE", "1") == "0":
             return
         rows = getattr(self, "_measure_rows", 0)
         if not rows or self.device is None or self.device.type != "cuda":
             return
+        total = self._autosplit_worst_case(rows)
+        if total > 0:
+            t = torch.empty((total,), dtype = torch.uint8, device = self.device)
+            del t
+
+    def _autosplit_worst_case(self, rows: int) -> int:
+        """Upper bound on this layer's prefill transient for a `rows`-token chunk, in bytes"""
         A = rows * self.num_experts_per_tok
         host = getattr(self, "cpu_host", None)
         if host is not None and getattr(self, "cpu_layer_idx", None) is not None:
@@ -912,9 +943,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 total = max(total, gf + cf + max(gv, cv))
         else:
             total = sum(self.prefill_worst_case_parts(rows, A))
-        if total > 0:
-            t = torch.empty((total,), dtype = torch.uint8, device = self.device)
-            del t
+        return total
 
     def _run_batch_recon(self, recon, y, fhs_ext, token_sorted, weight_sorted, expert_count_list, groups,
                          scratch = None, tables = None):
@@ -948,78 +977,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             handled.update(grp)
         return handled
 
-    def _rdna3_moe_ready(self) -> bool:
-        st = getattr(self, "_rdna3_moe_state", None)
-        if st is None:
-            ok = (
-                self.gated and self.activation_fn == "silu" and self.is_quantized and
-                getattr(self, "support_quant_paths", False) and
-                self.multi_gate is not None and self.multi_up is not None and self.multi_down is not None and
-                self.multi_gate.K == self.multi_up.K and self.act_limit in (None, 0, 0.0) and
-                self.multi_up.mcg == self.multi_down.mcg and self.multi_up.mul1 == self.multi_down.mul1 and
-                self.device is not None and self.device.type == "cuda"
-            )
-            st = self._rdna3_moe_state = {"ok": ok, "sh": None, "sh_gate": None, "K_sh": 0.0}
-            if ok:
-                # Shared expert in the same pipeline (one extra pair per token): a single-slice
-                # EXL3 silu GatedMLP on the routed input, merged without a post norm
-                se = self.shared_experts
-                if (
-                    _rdna3_moe_shared and se is not None and
-                    len(getattr(se, "gates", [])) == 1 and len(se.ups) == 1 and len(se.downs) == 1 and
-                    se.activation_fn == "silu" and self.shared_experts_post_norm is None and
-                    self.latent_in is None and not self.alt_residual_channel and self.routed_pre_norm is None and
-                    all(l.quant_type == "exl3" for l in (se.gates[0], se.ups[0], se.downs[0])) and
-                    se.gates[0].inner.K == se.ups[0].inner.K == se.downs[0].inner.K and
-                    all(l.inner.mul1 == self.multi_up.mul1 and l.inner.mcg == self.multi_up.mcg
-                        for l in (se.gates[0], se.ups[0], se.downs[0])) and
-                    all(l.inner.bias is None for l in (se.gates[0], se.ups[0], se.downs[0])) and
-                    se.gates[0].in_features == self.multi_up.in_features and
-                    se.gates[0].out_features == self.multi_up.out_features and
-                    (self.shared_gate is None or self.shared_gate.inner.weight.numel() == self.hidden_size)
-                ):
-                    lins = (se.gates[0].inner, se.ups[0].inner, se.downs[0].inner)
-                    st["sh"] = torch.tensor([t.data_ptr() for l in lins for t in (l.trellis, l.suh, l.svh)],
-                                            dtype = torch.long, device = self.device)
-                    if self.shared_gate is not None:
-                        st["sh_gate"] = self.shared_gate.inner.weight.reshape(-1).half().contiguous()
-                    st["K_sh"] = float(lins[0].K)
-                pmax = RDNA3_MOE_MAX_TOKENS * (self.num_experts_per_tok + 1)
-                I = self.multi_up.out_features
-                H = self.multi_down.out_features
-                st["tabs"] = g_tensor_cache.get(self.device, (6 * pmax + RDNA3_MOE_MAX_TOKENS,), torch.long, "rdna3_moe_tabs")
-                st["c_gu"] = g_tensor_cache.get(self.device, (2 * pmax, I), torch.half, "rdna3_moe_c_gu")
-                st["c_d"] = g_tensor_cache.get(self.device, (pmax, H), torch.float, "rdna3_moe_c_d")
-                st["out"] = g_tensor_cache.get(self.device, (RDNA3_MOE_MAX_TOKENS, H), torch.float, "rdna3_moe_out")
-        return st["ok"]
-
-    def _rdna3_moe_forward(self, y, bsz, selected_experts, routing_weights, eshape):
-        """Returns (routed sum incl. the shared expert when fused, shared expert fused)"""
-        st = self._rdna3_moe_state
-        sel = selected_experts
-        if self.routing_first and self.num_local_experts != self.num_experts:
-            sel = sel - self.routing_first
-        w = routing_weights if routing_weights.dtype == torch.half else routing_weights.half()
-        out = st["out"] if not g_tensor_cache.tag else \
-            g_tensor_cache.get(self.device, st["out"].shape, torch.float, "rdna3_moe_out")
-        out = out[:bsz]
-        mg, mu, md = self.multi_gate, self.multi_up, self.multi_down
-        ok = ext.exl3_rdna3_moe_decode(
-            y.contiguous(), sel.contiguous(), w.contiguous(),
-            mg.ptrs_trellis, mg.ptrs_suh, mg.ptrs_svh,
-            mu.ptrs_trellis, mu.ptrs_suh, mu.ptrs_svh,
-            md.ptrs_trellis, md.ptrs_suh, md.ptrs_svh,
-            float(mu.K), float(md.K), bool(mu.mcg), bool(mu.mul1),
-            self.num_local_experts or self.num_experts,
-            st["tabs"], st["c_gu"], st["c_d"], out,
-            st["sh"], st["sh_gate"], st["K_sh"],
-        )
-        assert ok, "exl3_rdna3_moe_decode declined a shape it was set up for"
-        return out.view(eshape), st["sh"] is not None
-
     @override
     def unload(self):
-        self._rdna3_moe_state = None
         self.cpu_unload()
         self.bc = None
         self.fused_mode_buffers = None
@@ -1036,6 +995,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.routing_cfg = None
         self.experts_cfg = None
         self.e_score_correction_bias = None
+        self.e_score_bias_vl = None
         self.tid2eid = None
         self.per_expert_scale = None
         self.bcast_sel_bsz1 = None
@@ -1068,7 +1028,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # f_threshold-1 instead of MAX_BSZN). Expert-range shards (CPU split, TP) are masked
         # inside the kernel (out-of-range picks contribute exact zeros). Shared experts run
         # through BC_GatedMLP's own multi-row graph ahead of the kernel (see mlp.py)
-        bszn_eligible = _bszn_enable and self.bc is not None and bsz <= MAX_BSZN
+        bszn_eligible = self.bc is not None and bsz <= MAX_BSZN
 
         # Routing
         if self.router_pre_norm:
@@ -1097,6 +1057,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.latent_in is not None:
             y = self.latent_in.forward(y, params)
 
+        # Calibration: the experts' output sensitivity is weighted by the routing the model would
+        # actually do, which is not the selection in use when every expert is activated
+        sens_weights = None
+        if "capture_sens" in params and self.gated and self.routing_gate is not None:
+            sel, w = selected_experts, routing_weights
+            if params.get("activate_all_experts"):
+                sel, w = self.routing_fn(
+                    bsz, self.routing_cfg, z, {k: v for k, v in params.items() if k != "activate_all_experts"})
+            sens_weights = torch.zeros((bsz, self.num_experts), dtype = torch.float, device = y.device)
+            sens_weights.scatter_(1, sel, w.float())
+
         if params.get("tp_warmup"):
             # Warmup runs without collectives on garbage-but-finite streams: every rank takes a
             # random (valid, spread-out) selection instead of routing, which exercises the
@@ -1115,30 +1086,25 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             if check:
                 _routing_check_compare(self.key, local_sel, local_w, selected_experts, routing_weights)
 
-        rdna3_moe = _rdna3_moe_enable and bsz <= RDNA3_MOE_MAX_TOKENS and self._rdna3_moe_ready()
-
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below
         # (folded back in by cpu_split_combine); whole-layer offload replaces the routed sum
         cpu_partial = None
         cpu_pending = None
         if self.cpu_split_first is not None and not params.get("autosplit_measure"):
-            cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights, params)
+            cpu_partial, cpu_pending = self.cpu_split_submit(y, bsz, selected_experts, routing_weights)
 
         if self.cpu_offload:
-            final_hidden_states = self.cpu_offload_forward(eshape, y, selected_experts, routing_weights, params)
+            final_hidden_states, cpu_pending = self.cpu_offload_issue(
+                eshape, y, selected_experts, routing_weights, params)
 
         # Empty slice
         elif self.intermediate_size == 0 or self.num_local_experts == 0:
             final_hidden_states = torch.zeros(eshape, dtype = torch.float, device = y.device)
 
-        # RDNA3 decode path
-        elif rdna3_moe:
-            final_hidden_states, bc_sh_exp = self._rdna3_moe_forward(y, bsz, selected_experts, routing_weights, eshape)
-
         # Torch/C++/fused path
         elif (
-            (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or not _bszn_enable or
+            (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
             self.config.infer_params.no_reconstruct or
             not (self.support_quant_paths or bszn_eligible)
         ):
@@ -1249,7 +1215,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             for b, e in enumerate(grp):
                                 base[e] = n_slots + b * cmax; kind[e] = 2
                             n_slots += len(grp) * cmax
-                        tables = torch.from_numpy(np.stack([base, starts_np, kind])).to(y.device, non_blocking = True)
+                        tables = host_to_device(torch.from_numpy(np.stack([base, starts_np, kind])), y.device)
                     scratch = torch.empty((max(n_slots, 1), y.shape[1]), dtype = torch.float, device = y.device)
 
                 def run_fused(num_active, count_lo = 1, count_hi = self.fused_rows, m_tile = 16):
@@ -1369,7 +1335,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                                 interm_a_ = interm_a[:count]
 
                             yh = torch.empty((count * 2, self.expert_size), dtype = torch.half, device = self.device)
-                            self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm_, interm_a_, out_state)
+                            self.bc.run_single_expert_dq(current_state, expert_idx, yh, interm_, interm_a_, out_state_)
                             current_state = out_state_
                     else:
 
@@ -1378,6 +1344,17 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                             u = self.ups[exp_i].forward(xc, params)
                             if self.gated:
                                 g = self.gates[exp_i].forward(xc, params)
+                                if sens_weights is not None:
+                                    exp_g = exp_i if self.num_local_experts == self.num_experts \
+                                        else exp_i + self.routing_first
+                                    sw = sens_weights[top_x, exp_g]
+                                    routed = sw.nonzero().flatten()
+                                    if routed.numel():
+                                        capture_out_sensitivity(
+                                            params["capture_sens"], self.gates[exp_i], self.ups[exp_i],
+                                            self.downs[exp_i], g[routed], u[routed], self.activation_fn,
+                                            self.act_limit, sw[routed]
+                                        )
                                 a = u if self.interm_dtype == torch.half else torch.empty_like(u, dtype = torch.half)
                                 self.activation_fn_call(g, u, a, self.act_limit)
                             else:
@@ -1408,12 +1385,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             final_hidden_states = self.experts_cfg.out_bszn[:bsz].view(eshape)
             bc_sh_exp = self.bc_sh_exp
 
-        # Micro-batch overlap (Model.forward_overlap): hand the stream to the other micro-batch while the worker
-        # computes this one's CPU experts, collect after. Only the RDNA3 decode path, whose routed sum lives in a
-        # per-micro-batch buffer
-        mb_yield = params.get("mb_yield")
-        if mb_yield is not None and cpu_pending is not None and rdna3_moe:
-            mb_yield()
+        # Independent shared-expert work can cover the CPU job (split tail or whole layer)
+        # before collect enqueues its stream wait. Fused shared experts have already run
+        # inside the routed path. Keep prefill scheduling and the order of post norms / TP
+        # collectives unchanged.
+        shared_hidden_states = None
+        if cpu_pending is not None and bsz <= MAX_BSZN and self.shared_experts and not bc_sh_exp:
+            shared_hidden_states = self.shared_experts.forward(x, params)
 
         # CPU tail partial folds in before the post norms (nonlinear: they must see the
         # complete routed sum)
@@ -1445,7 +1423,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Shared experts
         if self.shared_experts and not bc_sh_exp:
-            y = self.shared_experts.forward(x, params)
+            y = shared_hidden_states
+            if y is None:
+                y = self.shared_experts.forward(x, params)
             if pre_norm_reduce:
                 self.tp_collect(params["backend"], y, True)
             if self.shared_experts_post_norm:
@@ -1511,6 +1491,29 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         return g.in_features % 128 == 0 and g.out_features % 128 == 0 and d.out_features % 128 == 0 \
             and self.hidden_size <= d.out_features
 
+    def tp_prefill_bound(self, tokens: int, s: int, channels: int, tensor_split: bool) -> int:
+        """Prefill transients on a TP rank holding s of channels, the same bound the layer-split
+        loader reserves (prefill_worst_case_parts) but taken from config shapes, since the TP split
+        is planned before load. Expert split: this rank's share of the assignments on full-width
+        experts (a hot expert beyond that share is covered only by the reserve). Tensor split: every
+        assignment, on experts holding this rank's intermediate slice"""
+        h = self.expert_size
+        if s == 0:
+            return tokens * h * torch.float.itemsize  # empty slice: zeroed accumulator only
+        top_k = self.num_experts_per_tok
+        if tensor_split:
+            a, interm = tokens * top_k, s * 128
+        else:
+            a, interm = -(-tokens * top_k * s // channels), self.intermediate_size_padded
+        # Whether the batched reconstruct tier will be available is assumed from the tensors
+        # being EXL3 rather than checked (_batch_recon_layer needs the loaded layer)
+        batched = BATCH_RECON and self.config.stc.has_tensor(f"{self.ups[0].key}.trellis")
+        recon_dims = (
+            (h, interm) if self.gated else None, (h, interm), (interm, h),
+            self.interm_dtype == torch.float
+        ) if batched else None
+        return sum(self._prefill_bound(tokens, a, interm, recon_dims))
+
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
         storage = 0
         if self.shared_gate:
@@ -1523,25 +1526,23 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         storage_d = 3 * self.routing_gate.storage_size()
         if self.latent_in is not None:
             storage_d += self.latent_in.storage_size() + self.latent_out.storage_size()
-        # TODO: More precise overhead estimate accounting for gate etc.
-        overhead_d = self.hidden_size * torch.float.itemsize
-        overhead_s = 4 * self.intermediate_size * (self.interm_dtype or torch.half).itemsize
-        if self.interm_dtype != torch.half:
-            overhead_s += self.intermediate_size * torch.half.itemsize
+        # Routing selection plus the argsort / sorted token, weight / inverse order index tensors
+        overhead_d = self.num_experts_per_tok * 48
         recons = max(
             self.gates[0].recons_size() if self.gated else 0,
             self.ups[0].recons_size(),
             self.downs[0].recons_size()
         )
         use_tp_split = options.get("moe_tensor_split", False)
-        tpa = TPAllocation(
+        tpa = MoETPAllocation(
+            module = self,
+            tensor_split = use_tp_split,
             key = self.key,
             channel_width = 128 if use_tp_split else 1,
             channel_unit = "channels" if use_tp_split else "experts",
             storage_per_device = storage_d,
             storage_to_split = storage,
             overhead_per_device = overhead_d,
-            overhead_to_split = overhead_s,
             recons_temp = recons,
             channels_to_split = self.ups[0].out_features // 128 if use_tp_split else self.num_experts,
             limit_key = "moe"
@@ -1574,8 +1575,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 "num_experts": self.num_experts,
                 "num_experts_per_tok": self.num_experts_per_tok,
                 "interm_dtype": self.interm_dtype,
+                "interm_div": self.interm_div,
                 "router_type": self.router_type,
-                "routed_scaling_factor": self.routed_scaling_factor,
+                # The constructor folds interm_div into the routing scale again on import, so
+                # send the pre-fold value (the expert tensors arrive already rescaled)
+                "routed_scaling_factor": self.routed_scaling_factor / self.interm_div
+                    if (self.interm_div != 1.0 and self.router_type != "std") else self.routed_scaling_factor,
                 "n_group": self.n_group,
                 "topk_group": self.topk_group,
                 "act_limit": self.act_limit,

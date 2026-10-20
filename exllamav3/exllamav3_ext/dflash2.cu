@@ -6,14 +6,6 @@
 #include <ATen/cuda/CUDAContext.h>
 #include "util.h"
 #include "util.cuh"
-// ROCM_LDCG: ROCm hanya punya __ldcg half/half2 — lengkapi float/int/uint/short
-#ifdef __HIP_PLATFORM_AMD__
-__device__ __forceinline__ float __ldcg(const float* p) { return __builtin_nontemporal_load(p); }
-__device__ __forceinline__ int __ldcg(const int* p) { return __builtin_nontemporal_load(p); }
-__device__ __forceinline__ unsigned int __ldcg(const unsigned int* p) { return __builtin_nontemporal_load(p); }
-__device__ __forceinline__ unsigned short __ldcg(const unsigned short* p) { return __builtin_nontemporal_load(p); }
-#endif
-
 
 // DFlash2 grouped dynamic causal convolution over a draft block (dflash.model
 // _grouped_dynamic_convolve):
@@ -135,6 +127,7 @@ void dflash2_dynconv
     TORCH_CHECK(base.size(1) == hidden, "dflash2_dynconv: base width mismatch");
     TORCH_CHECK(dyn.size(0) == bsz && dyn.size(1) == seqlen && dyn.size(2) == taps && dyn.size(3) == hidden / group_size,
                 "dflash2_dynconv: dyn must be (bsz, seqlen, taps, hidden / group_size)");
+    TORCH_CHECK(seqlen <= 65535 && bsz <= 65535, "dflash2_dynconv: seqlen and bsz must be at most 65535 (grid y/z limit)");
     if (!bsz || !seqlen || !hidden) return;
 
     #define DISPATCH(TX, TB, TO) \
@@ -221,7 +214,7 @@ void dflash2_selector_walk_kernel
             for (int r = lane; r < rank; r += 32)
                 dot += a_g[r] * to_f(b_row[r]);
             for (int offset = 16; offset > 0; offset /= 2)
-                dot += __shfl_xor_sync(EXL3_FULL_MASK, dot, offset);
+                dot += __shfl_xor_sync(0xffffffff, dot, offset);
             if (lane == 0) scores[c] = u_row[c] + dot;
         }
         __syncthreads();
@@ -294,8 +287,9 @@ void dflash2_selector_walk
     TORCH_CHECK(out.size(0) == bsz && out.size(1) == rows + 1, "dflash2_selector_walk: out must be (bsz, rows + 1)");
     TORCH_CHECK(!conf.has_value() || (conf.value().is_contiguous() && conf.value().sizes() == out.sizes()),
                 "dflash2_selector_walk: conf must be (bsz, rows + 1), contiguous");
-    TORCH_CHECK(k >= 1 && rank >= 1, "dflash2_selector_walk: empty candidate list or rank");
-    if (!bsz || !rows) return;
+    // rank = 0 is an empty dot product (scores = unary); rows = 0 still writes the anchor column
+    TORCH_CHECK(k >= 1, "dflash2_selector_walk: argmax over an empty candidate list");
+    if (!bsz) return;
 
     size_t smem = (rank + k) * sizeof(float);
     float* conf_ptr = conf.has_value() ? (float*) conf.value().data_ptr() : nullptr;
@@ -341,14 +335,14 @@ __device__ __forceinline__ void warp_topk(float (&x)[N], int (&id)[N], float* ou
         float best = cur; int best_lane = lane;
         for (int offset = 16; offset > 0; offset /= 2)
         {
-            float o_best = __shfl_xor_sync(EXL3_FULL_MASK, best, offset);
-            int o_lane = __shfl_xor_sync(EXL3_FULL_MASK, best_lane, offset);
+            float o_best = __shfl_xor_sync(0xffffffff, best, offset);
+            int o_lane = __shfl_xor_sync(0xffffffff, best_lane, offset);
             if (o_best > best || (o_best == best && o_lane < best_lane)) { best = o_best; best_lane = o_lane; }
         }
         int best_id = -1;
         #pragma unroll
         for (int i = 0; i < N; ++i) if (i == arg) best_id = id[i];
-        best_id = __shfl_sync(EXL3_FULL_MASK, best_id, best_lane);
+        best_id = __shfl_sync(0xffffffff, best_id, best_lane);
         if (lane == 0) { out_v[k] = best; out_ix[k] = best_id; }
         if (lane == best_lane)
         {
@@ -523,14 +517,15 @@ void dflash2_topk
     int rows = logits.size(1);
     int k = values.size(2);
     TORCH_CHECK(values.size(0) == bsz && values.size(1) == rows, "dflash2_topk: output shape mismatch");
+    TORCH_CHECK(vocab > 0, "dflash2_topk: top-k over an empty vocab");
     TORCH_CHECK(vocab >= k && vocab <= logits.size(2), "dflash2_topk: vocab out of range");
     TORCH_CHECK(k == 8 || k == 16 || k == 32, "dflash2_topk: k must be 8, 16 or 32");
+    TORCH_CHECK(vocab <= 64 * TOPK_THREADS * 32, "dflash2_topk: vocab too large (max 524288)");
     if (!bsz || !rows) return;
 
     // Elements per thread: 16 covers rows up to 64 splits * 4096 = 262144 columns (the final
     // merge holds splits * K entries at K / 4 per thread), 32 up to 524288
     int E = vocab <= 64 * TOPK_THREADS * 16 ? 16 : 32;
-    TORCH_CHECK(vocab <= 64 * TOPK_THREADS * 32, "dflash2_topk: vocab too large (max 524288)");
     TORCH_CHECK(((uintptr_t) logits.data_ptr() & 15) == 0 && (logits.stride(0) * logits.element_size()) % 16 == 0 &&
                 (logits.stride(1) * logits.element_size()) % 16 == 0, "dflash2_topk: logits rows must be 16-byte aligned");
     int splits = CEIL_DIVIDE(vocab, TOPK_THREADS * E);

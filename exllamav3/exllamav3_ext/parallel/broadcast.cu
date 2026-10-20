@@ -10,7 +10,6 @@
 #include "ll.cuh"
 #include "barrier_inner.cuh"
 
-
 #define NUM_THREADS 1024
 #define NUM_THREADS_LL 256
 
@@ -109,7 +108,8 @@ void pg_broadcast_kernel
             // All warps must finish staging before thread 0 publishes the counter; the release store only
             // orders the issuing thread's own prior writes
             __syncthreads();
-            stg_release_sys_u32(broadcast_stages_ptr + this_device, local_stage);
+            if (t == 0)
+                stg_release_sys_u32(broadcast_stages_ptr + this_device, local_stage);
 
             // Wait for all consumers to be at most NUM_BROADCAST_STAGES - 2 behind. After last stage, wait for
             // consumers to finish
@@ -179,7 +179,9 @@ void pg_broadcast_kernel
 
             // Signal stage is produced
             local_stage++;
-            stg_release_sys_u32(&broadcast_stages_ptr[this_device], local_stage);
+            __syncthreads();
+            if (t == 0)
+                stg_release_sys_u32(&broadcast_stages_ptr[this_device], local_stage);
         }
     }
 

@@ -1,7 +1,6 @@
 #pragma once
-#include "util.cuh"
 #include <cuda_fp16.h>
-#ifndef __HIP_PLATFORM_AMD__
+#if !defined(USE_ROCM)
 #include <mma.h>
 #endif
 
@@ -27,7 +26,9 @@ rounded __fsqrt_rn / __fdiv_rn, whose results are unique by definition.
 
 */
 
-#include "ptx.cuh"
+// The tensor-core blocks below (int8 MMA, ldmatrix, cp.async and the fragment loaders) are CUDA's; ROCm builds
+// take the int8 WMMA warp tiles and copy helpers of rocm/det_gemm_rocm.cuh (included at the end) instead. The
+// quantization, flush and transcendentals are shared
 
 #define DET_QMAX 16319.0f          // |q| <= 16319 keeps hi in [-128, 127] with the shifted split
 #define DET_I8_LDS 80
@@ -63,39 +64,19 @@ __device__ __forceinline__ void det_quant16(const float* v, float inv, int4& hi4
     lo4 = make_int4(pl[0], pl[1], pl[2], pl[3]);
 }
 
-#ifdef __HIP_PLATFORM_AMD__
+#if !defined(USE_ROCM)
+
 __device__ __forceinline__ void det_mma_s8(int* c, const unsigned* a, const unsigned* b)
 {
-    // ROCm emulasi m16n8k32 s8 (PTX lane map: r=lane>>2, cc=lane&3)
-    unsigned lane = rocm_lane(); int r = lane >> 2, cc = lane & 3;
-    int acc0 = c[0], acc1 = c[1], acc2 = c[2], acc3 = c[3];
-    #pragma unroll
-    for (int t = 0; t < 4; ++t)
-    {
-        unsigned ar0 = __shfl_sync(EXL3_FULL_MASK, a[0], 4 * r + t);
-        unsigned ar1 = __shfl_sync(EXL3_FULL_MASK, a[1], 4 * r + t);
-        unsigned ar2 = __shfl_sync(EXL3_FULL_MASK, a[2], 4 * r + t);
-        unsigned ar3 = __shfl_sync(EXL3_FULL_MASK, a[3], 4 * r + t);
-        unsigned b00 = __shfl_sync(EXL3_FULL_MASK, b[0], 8 * cc + t);
-        unsigned b01 = __shfl_sync(EXL3_FULL_MASK, b[1], 8 * cc + t);
-        unsigned b10 = __shfl_sync(EXL3_FULL_MASK, b[0], 8 * cc + 4 + t);
-        unsigned b11 = __shfl_sync(EXL3_FULL_MASK, b[1], 8 * cc + 4 + t);
-        acc0 += rocm_dp4a_(ar0, b00, 0) + rocm_dp4a_(ar2, b01, 0);
-        acc1 += rocm_dp4a_(ar0, b10, 0) + rocm_dp4a_(ar2, b11, 0);
-        acc2 += rocm_dp4a_(ar1, b00, 0) + rocm_dp4a_(ar3, b01, 0);
-        acc3 += rocm_dp4a_(ar1, b10, 0) + rocm_dp4a_(ar3, b11, 0);
-    }
-    c[0] = acc0; c[1] = acc1; c[2] = acc2; c[3] = acc3;
-}
-#else
-__device__ __forceinline__ void det_mma_s8(int* c, const unsigned* a, const unsigned* b)
-{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-}
+#else
+    (void) c; (void) a; (void) b;
 #endif
+}
 
 // One k32 step of the three-pass product for a 16 x 8 tile: hh += A_hi B_hi; x += A_hi B_lo + A_lo B_hi
 __device__ __forceinline__ void det_mma3(int* acc_hh, int* acc_x, const unsigned* ah, const unsigned* al, const unsigned* bh, const unsigned* bl)
@@ -109,6 +90,8 @@ __device__ __forceinline__ void det_mma3(int* acc_hh, int* acc_x, const unsigned
     det_mma_s8(acc_x, ax1, bx1);
 }
 
+#endif  // !USE_ROCM
+
 // Exact chunk sums -> fp32 with the chunk's activation scale, fixed order, no contraction
 __device__ __forceinline__ float det_flush(int hh, int x, float scale, float acc)
 {
@@ -116,34 +99,43 @@ __device__ __forceinline__ float det_flush(int hh, int x, float scale, float acc
     return __fmaf_rn(sum, scale, acc);
 }
 
-__device__ __forceinline__ unsigned det_smem_u32(const void* p) { return rocm_g2s(p); }
-#ifdef __HIP_PLATFORM_AMD__
+#if !defined(USE_ROCM)
+
+__device__ __forceinline__ unsigned det_smem_u32(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
 __device__ __forceinline__ void det_cp_async16(unsigned dst, const void* src, int src_bytes)
 {
-    char* d = (char*) rocm_sh_ptr(dst);
-    unsigned char tmp[16];
-    for (int i = 0; i < 16; ++i) tmp[i] = i < src_bytes ? ((const unsigned char*) src)[i] : 0;
-    *(uint4*) d = *(const uint4*) tmp;
-}
-__device__ __forceinline__ void det_cp_async_commit() { }
-template <int N> __device__ __forceinline__ void det_cp_async_wait() { __syncthreads(); }
-__device__ __forceinline__ void det_ldmatrix_x4(unsigned* r, unsigned addr)
-{
-    rocm_ldsm4(r, rocm_sh_ptr(addr));
-}
-#else
-__device__ __forceinline__ void det_cp_async16(unsigned dst, const void* src, int src_bytes)
-{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(src), "r"(src_bytes));
+#else
+    (void) dst; (void) src; (void) src_bytes;
+#endif
 }
-__device__ __forceinline__ void det_cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
-template <int N> __device__ __forceinline__ void det_cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+__device__ __forceinline__ void det_cp_async_commit()
+{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+template <int N> __device__ __forceinline__ void det_cp_async_wait()
+{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#else
+    (void) N;
+#endif
+}
 __device__ __forceinline__ void det_ldmatrix_x4(unsigned* r, unsigned addr)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
-}
+#else
+    (void) r; (void) addr;
 #endif
+}
+
+#endif  // !USE_ROCM
+
 // Byte offset of 16-byte piece c (0..7) of row r in a dense 128-byte-row int8 tile, XOR-swizzled
 // so that both 16-byte async stores and ldmatrix fragment loads are bank-conflict free
 __device__ __forceinline__ int det_swz8(int r, int c) { return r * 128 + ((c ^ (r & 7)) << 4); }
@@ -151,6 +143,8 @@ __device__ __forceinline__ int det_swz8(int r, int c) { return r * 128 + ((c ^ (
 // Same for dense 64-byte rows (four 16-byte pieces): piece c ^ ((r >> 1) & 3)
 __device__ __forceinline__ int det_swz4(int r, int c) { return r * 64 + ((c ^ ((r >> 1) & 3)) << 4); }
 template <int ROWB> __device__ __forceinline__ int det_swz(int r, int c) { return ROWB == 128 ? det_swz8(r, c) : det_swz4(r, c); }
+
+#if !defined(USE_ROCM)
 
 // A fragment (16 x 32 int8, one m-tile) for lane l via ldmatrix.x4: row (l & 7) + ((l >> 3) & 1) * 8, k piece (l >> 4)
 template <int ROWB = 128>
@@ -166,6 +160,8 @@ __device__ __forceinline__ void det_load_b2(unsigned* r4, unsigned tile_base, in
     const int n = n0 + (lane & 7) + ((lane >> 4) & 1) * 8;
     det_ldmatrix_x4(r4, tile_base + det_swz<ROWB>(n, kpiece0 + ((lane >> 3) & 1)));
 }
+
+#endif  // !USE_ROCM
 
 // exp with FMAs only: 2^n * p(r), x = n ln2 + r. About 2 ulp; identical on every architecture
 __device__ __forceinline__ float exp_det(float x)
@@ -224,3 +220,7 @@ __device__ __forceinline__ float softplus_det(float x)
     if (x > 20.0f) return x;
     return log1p_det(exp_det(x));
 }
+
+#if defined(USE_ROCM)
+#include "rocm/det_gemm_rocm.cuh"
+#endif

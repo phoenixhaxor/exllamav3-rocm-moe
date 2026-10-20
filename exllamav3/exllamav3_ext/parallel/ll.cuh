@@ -1,5 +1,4 @@
 #pragma once
-#include "../util.cuh"
 
 __device__ __forceinline__ uint32_t synced_read_uint32
 (
@@ -28,7 +27,7 @@ __device__ __forceinline__ uint32_t synced_read_uint32
         }
     }
 
-    return uint32_t(packed & 0xffffffffull);
+    return uint32_t(packed & 0xffffffffu);
 }
 
 __device__ __forceinline__ void synced_write_uint32(uint64_t* p, uint32_t v, uint32_t cookie)

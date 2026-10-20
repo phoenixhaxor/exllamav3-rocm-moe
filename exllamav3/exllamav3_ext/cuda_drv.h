@@ -2,26 +2,24 @@
 
 #include <cuda.h>
 
-#ifdef __HIP_PLATFORM_AMD__
-// ROCm: driver-API aliases (hipify tidak mengkonversi cuGraph*)
-#ifndef PHX_DRV_ALIAS
-#define PHX_DRV_ALIAS 1
-#define cuGraphKernelNodeGetParams hipGraphKernelNodeGetParams
-#define cuGraphExecKernelNodeSetParams hipGraphExecKernelNodeSetParams
-#endif
-#endif
-
 // CUDA driver API entry points, resolved at runtime from the driver library so the extension
 // never links against libcuda (only the runtime is needed at build time). Symbol names are
 // stringified after macro expansion, so versioned entry points (cuGraphKernelNodeGetParams_v2
 // etc.) resolve to the same ABI the headers were compiled against.
+
+//
+// ROCm: the hipModule* / hipGraph* counterparts are exported by the HIP runtime library the extension already
+// links, so they are bound directly. There is no dynamic shared memory opt-in on AMD (a kernel may use all of
+// the LDS without one), hence no func_set_attribute.
 
 struct CudaDrv
 {
     decltype(&cuModuleLoadData)                 module_load_data;
     decltype(&cuModuleUnload)                   module_unload;
     decltype(&cuModuleGetFunction)              module_get_function;
+#if !defined(USE_ROCM)
     decltype(&cuFuncSetAttribute)               func_set_attribute;
+#endif
     decltype(&cuLaunchKernel)                   launch_kernel;
     decltype(&cuGraphKernelNodeGetParams)       graph_kernel_node_get_params;
     decltype(&cuGraphExecKernelNodeSetParams)   graph_exec_kernel_node_set_params;

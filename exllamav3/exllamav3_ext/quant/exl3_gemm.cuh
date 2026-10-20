@@ -32,37 +32,6 @@ int exl3_gemm
     int force_num_sms
 );
 
-bool exl3_gemm_silu_gr
-(
-    const at::Tensor& g,
-    const at::Tensor& u,
-    const at::Tensor& B,
-    at::Tensor& C,
-    const at::Tensor& suh,
-    const at::Tensor& svh,
-    bool mcg,
-    bool mul1,
-    Graph* graph,
-    bool gate_mode = false   // g * sigmoid(u) instead of silu(g) * u
-);
-
-bool exl3_gemm_gnorm_gr
-(
-    const at::Tensor& x,
-    const at::Tensor& g,
-    const at::Tensor& w,
-    float eps,
-    float bias,
-    bool sigmoid,
-    const at::Tensor& B,
-    at::Tensor& C,
-    const at::Tensor& suh,
-    const at::Tensor& svh,
-    bool mcg,
-    bool mul1,
-    Graph* graph
-);
-
 int exl3_mgemm_gr
 (
     const at::Tensor& A,

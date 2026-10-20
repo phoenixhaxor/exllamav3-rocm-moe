@@ -10,8 +10,8 @@ __device__ inline ValIdx warp_reduce_argmax(ValIdx v)
 {
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        float other_val = __shfl_down_sync(EXL3_FULL_MASK, v.val, offset);
-        int other_idx = __shfl_down_sync(EXL3_FULL_MASK, v.idx, offset);
+        float other_val = __shfl_down_sync(0xffffffff, v.val, offset);
+        int other_idx = __shfl_down_sync(0xffffffff, v.idx, offset);
         if (other_val > v.val)
         {
             v.val = other_val;
@@ -38,6 +38,7 @@ __device__ inline ValIdx block_reduce_argmax(ValIdx v)
         v = shared[lane_id];
         v = warp_reduce_argmax(v);
     }
+    __syncthreads();
     return v;
 }
 
@@ -45,7 +46,7 @@ __device__ inline half warp_reduce_max_h(half v)
 {
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        half2 other_v = __shfl_down_sync(EXL3_FULL_MASK, __half2half2(v), offset);
+        half2 other_v = __shfl_down_sync(0xffffffff, __half2half2(v), offset);
         v = __hmax(v, __low2half(other_v));
     }
     return v;
@@ -55,7 +56,7 @@ __device__ inline float warp_reduce_max_f(float v)
 {
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        float other_v = __shfl_down_sync(EXL3_FULL_MASK, v, offset);
+        float other_v = __shfl_down_sync(0xffffffff, v, offset);
         v = fmaxf(v, other_v);
     }
     return v;
@@ -79,6 +80,7 @@ __device__ inline half block_reduce_max_h(half v, int num_threads)
         v = lane_id < max_warp_id ? shared[lane_id] : NEG_INF_F16;
         v = warp_reduce_max_h(v);
     }
+    __syncthreads();
     return v;
 }
 
@@ -86,7 +88,7 @@ __device__ inline float warp_reduce_sum_f(float v)
 {
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        float other_v = __shfl_down_sync(EXL3_FULL_MASK, v, offset);
+        float other_v = __shfl_down_sync(0xffffffff, v, offset);
         v += other_v;
     }
     return v;
@@ -98,10 +100,10 @@ __device__ inline float warp_reduce_sum_last_k(float v, int K)
     if (lane_id < (32 - K)) v = 0.0f;
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        float other_v = __shfl_down_sync(EXL3_FULL_MASK, v, offset);
+        float other_v = __shfl_down_sync(0xffffffff, v, offset);
         v += other_v;
     }
-    v = __shfl_sync(EXL3_FULL_MASK, v, 0);
+    v = __shfl_sync(0xffffffffu, v, 0);
     return v;
 }
 
@@ -111,10 +113,10 @@ __device__ inline float warp_reduce_sum_first_k(float v, int K)
     if (lane_id >= K) v = 0.0f;
     for (int offset = 32 >> 1; offset > 0; offset >>= 1)
     {
-        float other_v = __shfl_down_sync(EXL3_FULL_MASK, v, offset);
+        float other_v = __shfl_down_sync(0xffffffff, v, offset);
         v += other_v;
     }
-    v = __shfl_sync(EXL3_FULL_MASK, v, 0);
+    v = __shfl_sync(0xffffffffu, v, 0);
     return v;
 }
 
@@ -136,6 +138,7 @@ __device__ inline float block_reduce_sum_f(float v, int num_threads)
         v = lane_id < max_warp_id ? shared[lane_id] : 0.0f;
         v = warp_reduce_sum_f(v);
     }
+    __syncthreads();
     return v;
 }
 
@@ -156,8 +159,6 @@ __device__ inline float block_reduce_sum_broadcast_f(float v, int num_threads)
     {
         v = lane_id < max_warp_id ? shared[lane_id] : 0.0f;
         v = warp_reduce_sum_f(v);
-        // Only lane 0 holds the full sum after the shfl_down reduction: an all-lanes store is a
-        // same-address race whose winner is unspecified (on RDNA3 it is not lane 0)
         if (lane_id == 0) shared[0] = v;
     }
     __syncthreads();

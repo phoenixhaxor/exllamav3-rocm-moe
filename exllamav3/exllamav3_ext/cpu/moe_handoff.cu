@@ -1,12 +1,12 @@
 #include "moe_handoff.h"
 #include "moe_mul1.h"
+#include "../routing.cuh"
 #include "moe_idle.h"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda.h>
 #include <atomic>
-#include <cstdlib>
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -18,12 +18,6 @@
 #else
 #include <intrin.h>
 #include <windows.h>
-
-#ifdef __HIP_PLATFORM_AMD__
-#ifndef CUDAAPI
-#define CUDAAPI
-#endif
-#endif
 #endif
 
 // Wait timeout: generous, the CPU may be chewing a full prefill chunk
@@ -35,22 +29,30 @@
 //   GPU flag kernels
 // -------------------------------------------------------------------------------------------
 
-// No longer used
-__global__ void moe_flag_write_kernel(uint32_t* flag, uint32_t value)
+// Fallback for when the stream memory operations are unavailable or disabled
+__global__ void moe_flag_write_kernel(moe_flag_t* flag, moe_flag_t value)
 {
+#if MOE_FLAG_BITS == 64
+    stg_release_sys_u64(flag, value);
+#else
     stg_release_sys_u32(flag, value);
+#endif
 }
 
-// No longer used
-__global__ void moe_flag_wait_kernel(uint32_t* flag, uint32_t value, uint32_t* abort_flag)
+// Fallback for when the stream memory operations are unavailable or disabled
+__global__ void moe_flag_wait_kernel(moe_flag_t* flag, moe_flag_t value, uint32_t* abort_flag)
 {
     uint64_t sleep = MOE_SLEEP_MIN;
     uint64_t waited = 0;
     while (true)
     {
+#if MOE_FLAG_BITS == 64
+        if (ldg_acquire_sys_u64(flag) >= value) return;
+#else
         uint32_t v = (uint32_t) ldg_acquire_sys_u32(flag);
         if ((int32_t)(v - value) >= 0) return;
-        { } (void) sleep;
+#endif
+        __nanosleep(sleep);
         waited += sleep;
         if (sleep < MOE_SLEEP_MAX) sleep <<= 1;
         if (waited > MOE_WAIT_TIMEOUT_NS)
@@ -70,17 +72,21 @@ __global__ void moe_flag_wait_kernel(uint32_t* flag, uint32_t value, uint32_t* a
 // writing satisfying values into the flags.
 namespace {
 
-#ifdef __HIP_PLATFORM_AMD__
-typedef unsigned int cuuint32_t;
-typedef hipError_t (*fn_stream_wait32)(hipStream_t, void*, cuuint32_t, unsigned int, uint32_t);
+#if defined(USE_ROCM)
+// HIP has the memops as runtime entry points in the library already linked. Its wait compares with a plain
+// unsigned >= rather than CUDA's cyclic one, hence the 64-bit flags (see moe_handoff.h)
+typedef hipError_t (*fn_stream_wait64)(hipStream_t, void*, uint64_t, unsigned int, uint64_t);
+typedef hipError_t (*fn_stream_write64)(hipStream_t, void*, uint64_t, unsigned int);
+
+struct MemOps
+{
+    fn_stream_wait64 wait = &hipStreamWaitValue64;
+    fn_stream_write64 write = &hipStreamWriteValue64;
+    bool resolved = true;
+};
 #else
-typedef hipError_t (*fn_stream_wait32)(hipStream_t, void*, cuuint32_t, unsigned int, uint32_t);
-#endif
-#ifdef __HIP_PLATFORM_AMD__
-typedef hipError_t (*fn_stream_write32)(hipStream_t, void*, cuuint32_t, unsigned int);
-#else
-typedef hipError_t (*fn_stream_write32)(hipStream_t, void*, cuuint32_t, unsigned int);
-#endif
+typedef CUresult (CUDAAPI* fn_stream_wait32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
+typedef CUresult (CUDAAPI* fn_stream_write32)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
 
 struct MemOps
 {
@@ -91,36 +97,26 @@ struct MemOps
     {
         // Symbol resolution is unconditional (independent of exl3_moe_cpu_set_memops): whether
         // the ops are used is a separate, mutable runtime switch, not a one-time decision
-#if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
-        // HIP exports the stream memory operations from the runtime itself (the hipified dlopen
-        // of the CUDA driver names looked in librocr and never resolved, so every flag wait and
-        // write ran as a kernel)
-        wait = [] (hipStream_t st, void* p, cuuint32_t v, unsigned int flags, uint32_t mask) -> hipError_t
-            { return hipStreamWaitValue32(st, p, v, flags, mask); };
-        write = [] (hipStream_t st, void* p, cuuint32_t v, unsigned int flags) -> hipError_t
-            { return hipStreamWriteValue32(st, p, v, flags); };
-        resolved = std::getenv("EXL3_MOE_HIP_MEMOPS") == nullptr || std::getenv("EXL3_MOE_HIP_MEMOPS")[0] != '0';
-        return;
-#endif
 #ifdef __linux__
-        void* h = dlopen("librocr.so", RTLD_LAZY);
-        if (!h) h = dlopen("librocr.so", RTLD_LAZY);
+        void* h = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_NOLOAD);
+        if (!h) h = dlopen("libcuda.so", RTLD_LAZY | RTLD_NOLOAD);
         if (!h) return;
-        wait = (fn_stream_wait32) dlsym(h, "hipStreamWaitValue32");
-        if (!wait) wait = (fn_stream_wait32) dlsym(h, "hipStreamWaitValue32");
-        write = (fn_stream_write32) dlsym(h, "hipStreamWriteValue32");
-        if (!write) write = (fn_stream_write32) dlsym(h, "hipStreamWriteValue32");
+        wait = (fn_stream_wait32) dlsym(h, "cuStreamWaitValue32_v2");
+        if (!wait) wait = (fn_stream_wait32) dlsym(h, "cuStreamWaitValue32");
+        write = (fn_stream_write32) dlsym(h, "cuStreamWriteValue32_v2");
+        if (!write) write = (fn_stream_write32) dlsym(h, "cuStreamWriteValue32");
 #else
         HMODULE h = GetModuleHandleA("nvcuda.dll");
         if (!h) return;
-        wait = (fn_stream_wait32) GetProcAddress(h, "hipStreamWaitValue32");
-        if (!wait) wait = (fn_stream_wait32) GetProcAddress(h, "hipStreamWaitValue32");
-        write = (fn_stream_write32) GetProcAddress(h, "hipStreamWriteValue32");
-        if (!write) write = (fn_stream_write32) GetProcAddress(h, "hipStreamWriteValue32");
+        wait = (fn_stream_wait32) GetProcAddress(h, "cuStreamWaitValue32_v2");
+        if (!wait) wait = (fn_stream_wait32) GetProcAddress(h, "cuStreamWaitValue32");
+        write = (fn_stream_write32) GetProcAddress(h, "cuStreamWriteValue32_v2");
+        if (!write) write = (fn_stream_write32) GetProcAddress(h, "cuStreamWriteValue32");
 #endif
         resolved = wait && write;
     }
 };
+#endif
 
 MemOps& memops() { static MemOps m; return m; }
 std::atomic<bool> g_memops_ok { true };
@@ -140,21 +136,16 @@ void exl3_moe_flag_write(uintptr_t flag, int64_t value)
     if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
-        #ifdef __HIP_PLATFORM_AMD__
-        hipError_t r2 = m.write(
-            (hipStream_t) stream,
-            (void*) flag,
-            (cuuint32_t) value,
-            0
-        );
-        if (r2 == hipSuccess) return;
+#if defined(USE_ROCM)
+        hipError_t r = m.write(stream, (void*) flag, (uint64_t) value, 0);
+        if (r == hipSuccess) return;
 #else
-CUresult r = m.write((CUstream) stream, (CUdeviceptr) flag, (cuuint32_t) value, 0);
+        CUresult r = m.write((CUstream) stream, (CUdeviceptr) flag, (cuuint32_t) value, 0);
         if (r == CUDA_SUCCESS) return;
 #endif
         g_memops_ok.store(false, std::memory_order_relaxed);
     }
-    moe_flag_write_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<uint32_t*>(flag), static_cast<uint32_t>(value));
+    moe_flag_write_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<moe_flag_t*>(flag), static_cast<moe_flag_t>(value));
 }
 
 void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
@@ -164,14 +155,8 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
     if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
         && g_memops_ok.load(std::memory_order_relaxed))
     {
-#ifdef __HIP_PLATFORM_AMD__
-        hipError_t r = m.wait(
-            (hipStream_t) stream,
-            (void*) flag,
-            (cuuint32_t) value,
-            hipStreamWaitValueGte,
-            0xFFFFFFFFu
-        );
+#if defined(USE_ROCM)
+        hipError_t r = m.wait(stream, (void*) flag, (uint64_t) value, hipStreamWaitValueGte, ~0ull);
         if (r == hipSuccess) return;
 #else
         CUresult r = m.wait(
@@ -186,10 +171,130 @@ void exl3_moe_flag_wait(uintptr_t flag, int64_t value, uintptr_t abort_flag)
     }
     moe_flag_wait_kernel<<<1, 1, 0, stream>>>
     (
-        reinterpret_cast<uint32_t*>(flag),
-        static_cast<uint32_t>(value),
+        reinterpret_cast<moe_flag_t*>(flag),
+        static_cast<moe_flag_t>(value),
         reinterpret_cast<uint32_t*>(abort_flag)
     );
+}
+
+// ---- fused split issue / collect -----------------------------------------------------------
+//
+// One call per layer per step for each half of the decode handoff, replacing the host-side job
+// descriptor write, ring check and the separate flag-wait / kernel / flag-write calls. The job
+// descriptor goes into the shared ring here (same layout as the Python writer); the flag memops
+// and the kernel are enqueued on the stream of the tensors' device. Returns false without
+// touching anything when the job ring is within its safety margin of overflowing, so the caller
+// can throttle and retry (a long prefill is the only way to get there).
+
+namespace {
+
+inline void flag_write_on(cudaStream_t stream, uintptr_t flag, int64_t value)
+{
+    MemOps& m = memops();
+    if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
+        && g_memops_ok.load(std::memory_order_relaxed))
+    {
+#if defined(USE_ROCM)
+        if (m.write(stream, (void*) flag, (uint64_t) value, 0) == cudaSuccess) return;
+#else
+        if (m.write((CUstream) stream, (CUdeviceptr) flag, (cuuint32_t) value, 0) == CUDA_SUCCESS) return;
+#endif
+        g_memops_ok.store(false, std::memory_order_relaxed);
+    }
+    moe_flag_write_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<moe_flag_t*>(flag), static_cast<moe_flag_t>(value));
+}
+
+inline void flag_wait_on(cudaStream_t stream, uintptr_t flag, int64_t value, uintptr_t abort_flag)
+{
+    MemOps& m = memops();
+    if (m.resolved && g_memops_enabled.load(std::memory_order_relaxed)
+        && g_memops_ok.load(std::memory_order_relaxed))
+    {
+#if defined(USE_ROCM)
+        if (m.wait(stream, (void*) flag, (uint64_t) value, hipStreamWaitValueGte, ~0ull) == cudaSuccess) return;
+#else
+        if (m.wait((CUstream) stream, (CUdeviceptr) flag, (cuuint32_t) value, CU_STREAM_WAIT_VALUE_GEQ) == CUDA_SUCCESS) return;
+#endif
+        g_memops_ok.store(false, std::memory_order_relaxed);
+    }
+    moe_flag_wait_kernel<<<1, 1, 0, stream>>>(
+        reinterpret_cast<moe_flag_t*>(flag), static_cast<moe_flag_t>(value), reinterpret_cast<uint32_t*>(abort_flag));
+}
+
+} // namespace
+
+bool exl3_moe_split_issue_fused
+(
+    uintptr_t shm_base,
+    int64_t seq,
+    int64_t layer,
+    int64_t rows,
+    int64_t topk,
+    int64_t slot,
+    int64_t prev_seq,
+    at::Tensor sel,
+    const c10::optional<at::Tensor>& map,
+    const c10::optional<at::Tensor>& hist,
+    const at::Tensor& y,
+    const at::Tensor& w,
+    int64_t h_sel_ptr,
+    int64_t h_x_ptr,
+    int64_t h_w_ptr,
+    at::Tensor dev_count,
+    int64_t hi,
+    int64_t first_cpu,
+    uintptr_t data_ready_flag,
+    uintptr_t consumed_flag,
+    uintptr_t abort_flag,
+    int64_t tail_rank,
+    const c10::optional<at::Tensor>& stats
+)
+{
+    uint8_t* base = reinterpret_cast<uint8_t*>(shm_base);
+    uint32_t* jobs_tail = reinterpret_cast<uint32_t*>(base + 256);
+    uint32_t* jobs_head = reinterpret_cast<uint32_t*>(base + 320);
+    MoeJob* jobs = reinterpret_cast<MoeJob*>(base + MOE_CTRL_JOBS_OFFSET);
+    const uint32_t tail = *jobs_tail;
+    if (tail - __atomic_load_n(jobs_head, __ATOMIC_ACQUIRE) >= MOE_JOB_RING - 4) return false;
+    // Descriptor first: host-visible before the GPU can publish the data flag
+    MoeJob& job = jobs[tail % MOE_JOB_RING];
+    job.seq = (uint32_t) (seq & 0xFFFFFFFFull);
+    job.seq_hi = (uint32_t) ((uint64_t) seq >> 32);
+    job.layer = (uint32_t) layer;
+    job.rows = (uint32_t) rows;
+    job.topk = (uint32_t) topk;
+    job.slot = (uint32_t) slot;
+    job.kind = MOE_JOB_KIND_COMPUTE_GATED;
+    __atomic_store_n(jobs_tail, tail + 1, __ATOMIC_RELEASE);
+
+    const at::cuda::OptionalCUDAGuard device_guard(y.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(y.get_device()).stream();
+    if (prev_seq) flag_wait_on(stream, consumed_flag, prev_seq, abort_flag);
+    moe_split_issue(sel, map, hist, y, w, h_sel_ptr, h_x_ptr, h_w_ptr, dev_count, slot, hi, first_cpu, tail_rank, stats);
+    flag_write_on(stream, data_ready_flag, seq);
+    return true;
+}
+
+void exl3_moe_split_collect_fused
+(
+    at::Tensor final_out,
+    int64_t h_out_ptr,
+    const at::Tensor& dev_count,
+    int64_t slot,
+    int64_t ho,
+    uintptr_t done_flag,
+    int64_t seq,
+    uintptr_t consumed_flag,
+    uintptr_t abort_flag
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(final_out.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(final_out.get_device()).stream();
+    flag_wait_on(stream, done_flag, seq, abort_flag);
+    moe_split_collect_add(final_out, h_out_ptr, dev_count, slot, ho);
+    // Consumption is published AFTER the readback on this same stream: the slot's next tenant
+    // (possibly issuing from another device) gates on it
+    flag_write_on(stream, consumed_flag, seq);
 }
 
 // ---- child worker loop --------------------------------------------------------------------
@@ -198,7 +303,9 @@ namespace {
 
 inline void cpu_pause_()
 {
-#ifdef __linux__
+#if defined(__aarch64__) || defined(__arm__)  // EXL3_AARCH64_PAUSE
+    asm volatile("yield" ::: "memory");
+#elif defined(__linux__)
     __builtin_ia32_pause();
 #else
     _mm_pause();
@@ -222,6 +329,21 @@ inline void store_release_u32(uint32_t* p, uint32_t v)
     (void)_InterlockedExchange(reinterpret_cast<volatile long*>(p), static_cast<long>(v));
 #else
     __atomic_store_n(p, v, __ATOMIC_RELEASE);
+#endif
+}
+
+// Publish a job's full sequence number into a flag (only the 64-bit flags take the high half)
+inline void store_release_flag(uint32_t* p, const MoeJob& job)
+{
+#if MOE_FLAG_BITS == 64
+    uint64_t v = (uint64_t(job.seq_hi) << 32) | job.seq;
+#if defined(_MSC_VER) && !defined(__clang__)
+    (void)_InterlockedExchange64(reinterpret_cast<volatile long long*>(p), static_cast<long long>(v));
+#else
+    __atomic_store_n(reinterpret_cast<uint64_t*>(p), v, __ATOMIC_RELEASE);
+#endif
+#else
+    store_release_u32(p, job.seq);
 #endif
 }
 
@@ -289,7 +411,7 @@ void exl3_moe_cpu_worker_run
             shead++;
             store_release_u32(stage_head, shead);
 
-            // Wait until the slot's previous tenant has been DMA'd out
+            // Wait until the slot's previous tenant has been DMA'd out (low half of the flag, cyclically)
             uint32_t* pf = pinned_free + size_t(job.slot) * 16;
             while ((int32_t)(load_acquire_u32(pf) - job.prev_seq) < 0)
             {
@@ -303,7 +425,7 @@ void exl3_moe_cpu_worker_run
                 wstage + size_t(job.slot) * wslot_size,
                 stage_threads_
             );
-            store_release_u32(stage_done + size_t(job.slot) * 16, job.seq);
+            store_release_flag(stage_done + size_t(job.slot) * 16, job);
         }
     });
 
@@ -321,6 +443,9 @@ void exl3_moe_cpu_worker_run
     long hp_jobs = 0, hp_empty = 0, hp_assign = 0, hp_rows = 0;
     auto hp_prev_end = std::chrono::steady_clock::now();
 
+    const char* prime_env = getenv("EXL3_MOE_POOL_PRIME");
+    const bool prime_pool = !prime_env || prime_env[0] != '0';
+    if (prime_pool) exl3_moe_cpu_pool_prime((int) threads);
     store_release_u32(ready, 1);
 
     uint32_t head = load_acquire_u32(jobs_head);
@@ -331,7 +456,12 @@ void exl3_moe_cpu_worker_run
         if (load_acquire_u32(quit)) break;
 
         const uint32_t wake = load_acquire_u32(pass_wake);
-        if (wake != last_wake) { last_wake = wake; idle = 0; }
+        if (wake != last_wake)
+        {
+            last_wake = wake;
+            idle = 0;
+            if (prime_pool) exl3_moe_cpu_pool_prime((int) threads);
+        }
 
         if (load_acquire_u32(jobs_tail) == head)
         {
@@ -349,7 +479,7 @@ void exl3_moe_cpu_worker_run
 
         const auto hp_t0 = std::chrono::steady_clock::now();
 
-        // Wait for the GPU to publish the staged inputs for this seq
+        // Wait for the GPU to publish the staged inputs for this seq (low half of the flag, cyclically)
         uint32_t* drdy = data_ready + size_t(job.slot) * 16;
         while ((int32_t)(load_acquire_u32(drdy) - job.seq) < 0)
         {
@@ -399,7 +529,7 @@ void exl3_moe_cpu_worker_run
                 );
         }
 
-        store_release_u32(done + size_t(job.slot) * 16, job.seq);
+        store_release_flag(done + size_t(job.slot) * 16, job);
 
         if (hprof)
         {

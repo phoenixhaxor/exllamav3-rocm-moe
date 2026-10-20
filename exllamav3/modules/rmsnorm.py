@@ -110,45 +110,24 @@ class RMSNorm(Module):
         out_dtype: torch.dtype | None = None,
         residual: torch.Tensor | None = None,
         residual_in: torch.Tensor | None = None,
-        had_for: tuple | None = None,
-        abl: tuple | None = None,
     ) -> torch.Tensor:
-        # had_for = (suh pointer table, num sources) of the projection bundle consuming y: the norm then
-        # also writes that bundle's matmul input transform (rms_norm_had, RDNA3), saving its input kernel
         dtype = out_dtype or self.out_dtype
 
         # Fused pre-norm residual: residual_in += x (in place), y = norm(residual_in)
-        # abl = (a, b, s): directional ablation of x (fp32) applied in the same kernel, before the add
         if residual_in is not None:
             x_2d = x.view(-1, x.shape[-1])
             r_2d = residual_in.view(-1, residual_in.shape[-1])
             y_2d = torch.empty_like(x_2d, dtype = dtype)
-            abl_a, abl_b, abl_s = abl if abl is not None else (None, None, None)
-            if not (had_for is not None and ext.rms_norm_had(
-                x_2d, self.weight, y_2d, r_2d, self.rms_norm_eps, self.constant_bias, self.constant_scale,
-                had_for[0], had_for[1], abl_a, abl_b, abl_s,
-            )):
-                ext.rms_norm_res_in(
-                    x_2d,
-                    self.weight,
-                    y_2d,
-                    r_2d,
-                    self.rms_norm_eps,
-                    self.constant_bias,
-                    self.constant_scale,
-                    abl_a,
-                    abl_b,
-                    abl_s,
-                )
+            ext.rms_norm_res_in(
+                x_2d,
+                self.weight,
+                y_2d,
+                r_2d,
+                self.rms_norm_eps,
+                self.constant_bias,
+                self.constant_scale,
+            )
             y = y_2d.view(x.shape)
-
-        elif had_for is not None and residual is None and not self.span_heads and self.groups == 1 and x.is_contiguous() and \
-                ext.rms_norm_had(
-                    x.view(-1, x.shape[-1]), self.weight, (y := torch.empty_like(x, dtype = dtype)).view(-1, x.shape[-1]),
-                    None, self.rms_norm_eps, self.constant_bias, self.constant_scale, had_for[0], had_for[1],
-                    None, None, None,
-                ):
-            pass
 
         # ext.rms_norm expects row-major 2D inputs for the standard
         # per-channel RMSNorm path. Flattening keeps results consistent across
@@ -236,7 +215,7 @@ class RMSNorm(Module):
         )
         module.device = device
         w = consumer.recv(exported["weight"], cuda = True)
-        module.weight = nn.Parameter(w) if w is not None else None
+        module.weight = nn.Parameter(w, requires_grad = False) if w is not None else None
         # span_heads is preserved via kwargs
         torch.cuda.synchronize()
         return module
@@ -260,7 +239,7 @@ class RMSNorm(Module):
                 # 1D weight tensor (e.g., span_heads=True norms)
                 # split contains element indices
                 w = w[first : last]
-            module.weight = nn.Parameter(w.to(module.device).contiguous())
+            module.weight = nn.Parameter(w.to(module.device).contiguous(), requires_grad = False)
         # span_heads is preserved via kwargs
 
         return module

@@ -6,10 +6,11 @@ import weakref
 from ..cache import Cache
 from ..model.config import no_default
 from ..model.model import Model
-from ..modules import RMSNorm, Attention, GatedMLP
+from ..modules import RMSNorm, Attention, SlidingAttention, SWAState, GatedMLP
 from ..modules.arch_specific.dflash import DFlashInputLayer
 from ..modules.arch_specific.dflash2 import DFlash2Block, DFlash2DynConv, DFlash2Selector
 from ..modules.attn import prepare_for_attn
+from ..cache.recurrent_util import prepare_for_recurrence
 from .dflash import DFlashConfig, dflash_update_kv_from_target
 from ..util.tensor import get_for_device
 from ..util.device_copy import to_device
@@ -23,6 +24,9 @@ from ..util.device_copy import to_device
 #     its own position and the selector walks candidates starting from the anchor.
 #   - Taps: reference reads HF hidden_states[target_layer_ids[i] + 1] = output
 #     of target layer id  =>  tap_shift 0 (exl3 export index = layer output).
+#   - Block attention direction: the checkpoint's "is_causal" decides whether block rows
+#     see later rows (reference default: causal only on sliding-window layers); windowed
+#     layers express it through (left, right) window bounds, see DFlashConfig.block_window.
 #   - Draft cache ctx K/V come from the shared DFlash K/V update (fc+hidden_norm
 #     projected tap stream); per-round writes at the new cache position overwrite
 #     the transient noise-block K/V, reproducing the reference's crop semantics.
@@ -84,9 +88,11 @@ class DFlash2Model(Model):
     def __init__(
         self,
         config: DFlash2Config,
+        swa_full: bool = False,
         **kwargs
     ):
         super().__init__(config, **kwargs)
+        self.swa_full = swa_full
 
         self.input_layer = DFlashInputLayer(
             config = config,
@@ -106,9 +112,12 @@ class DFlash2Model(Model):
         self.attn_modules = []
 
         for idx in range(config.num_hidden_layers):
-            is_swa = config.layer_types[idx] == "sliding_attention"
+            window_left, window_right = config.block_window(idx)
 
-            attn = Attention(
+            # Sliding-window layers keep a window ring per sequence (see DFlashModel); -swa_full
+            # keeps the paged cache
+            swa = config.layer_types[idx] == "sliding_attention" and not swa_full
+            attn = (SlidingAttention if swa else Attention)(
                 config = config,
                 key = f"layers.{idx}.self_attn",
                 layer_idx = idx,
@@ -122,7 +131,8 @@ class DFlash2Model(Model):
                 key_v = "v_proj",
                 key_o = "o_proj",
                 qmap = "block.attn",
-                sliding_window = config.sliding_window if is_swa else -1,
+                sliding_window = window_left,
+                window_right = window_right,
                 q_norm = RMSNorm(
                     config = config,
                     key = f"layers.{idx}.self_attn.q_norm",
@@ -213,6 +223,13 @@ class DFlash2Model(Model):
             "default_draft_size": config.block_size - 1,
             "autosplit_load_fwd": False,
         })
+        self.recurrent_state_cls = None
+        if any(isinstance(m, SlidingAttention) for m in self.attn_modules):
+            self.caps.update({
+                "recurrent_states": True,
+                "default_recurrent_checkpoint_interval": 2048,
+            })
+            self.recurrent_state_cls = SWAState
 
         self.attached_model = None
 
@@ -222,10 +239,6 @@ class DFlash2Model(Model):
 
 
     def attach_to(self, target):
-        if target.loaded_tp:
-            raise NotImplementedError(
-                "DFlash2 does not support tensor-parallel targets because the selector needs top-k logits"
-            )
         if target.config.vocab_size != self.config.vocab_size:
             raise ValueError(
                 f"DFlash2 vocabulary size {self.config.vocab_size} does not match "
@@ -268,14 +281,30 @@ class DFlash2Model(Model):
         anchor. The selector is greedy; sampling remains lossless because the
         target verifier still samples normally and accepts only exact matches."""
         target = self.attached_model()
-        lm = target.modules[target.logit_layer_idx]
-        logits = lm.prepare_for_device(state.half(), params)
-        logits = lm.forward(logits, params)
-
         dev = self.selector.device
         # The generator stages the block ids in pinned memory: upload without a host sync
         anchor = get_for_device(params, "dflash2_anchor_ids", dev)[:, -1]
         export_conf = params.get("export_draft_conf", False)
+        if target.loaded_tp:
+            # Tensor-parallel target: each rank takes the selector's top-k over its vocabulary slice of
+            # the head and the candidates are merged on the output device, so only k ids and scores per
+            # row cross the ranks, never the logits. The drafter stays on one device
+            staged = target.tp_producer.send(state[:, 1:].half())
+            unary, cands = target.tp_dispatch_lm_head_topk(
+                (staged, {}), self.selector.top_k,
+                scale = self.config.output_multiplier, softcap = self.config.final_logit_softcapping or 0.0,
+            )
+            out, confidence = self.selector.walk_candidates(
+                to_device(state[:, 1:], dev), to_device(unary, dev), to_device(cands, dev), anchor,
+                return_confidence = export_conf,
+            )
+            if export_conf:
+                params["draft_conf"] = confidence
+            return out
+
+        lm = target.modules[target.logit_layer_idx]
+        logits = lm.prepare_for_device(state.half(), params)
+        logits = lm.forward(logits, params)
         # [anchor, path...] and [0, score...] straight from the selector, in the block layout
         # the generator consumes. The head's padded width, the output multiplier and the
         # softcap (Gemma-class targets) are handled inside the selector's top-k. The state
@@ -306,10 +335,13 @@ class DFlash2Model(Model):
         assert input_ids.shape[-1] == 1, \
             "DFlash2 expects one verified anchor token per draft block"
         params["dflash2_anchor_ids"] = input_ids
-        # The draft block attends to itself bidirectionally; causality on the sliding-window
-        # layers is expressed through their window (left sw, right 0) instead
-        params["causal"] = False
-        return prepare_for_attn(input_ids, params)
+        # Block attention direction per the checkpoint (DFlashConfig.block_window): the kernel
+        # flag is only needed when every layer is causal; windowed layers carry their own bounds
+        params["causal"] = self.config.is_causal is True
+        input_ids = prepare_for_attn(input_ids, params)
+        if self.recurrent_state_cls is not None:
+            prepare_for_recurrence(input_ids, params, self)
+        return input_ids
 
 
     @override

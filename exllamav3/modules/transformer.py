@@ -4,34 +4,8 @@ import torch
 from ..util.tensor import to2
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
-from .hyperconnections import HyperConnection
+from .hyperconnections import HyperConnection, hc_flush
 from ..util import profile_opt
-import os
-from ..ext import exllamav3_ext as ext
-_norm_had_enable = os.environ.get("EXL3_FUSE_NORM_HAD", "1") != "0"
-_abl_kernel = os.environ.get("EXL3_ABL_KERNEL", "1") != "0"
-# Fold the ablation of a sublayer output into the RMSNorm kernel that adds it to the residual
-_abl_fuse = _abl_kernel and os.environ.get("EXL3_ABL_FUSE", "1") != "0"
-
-
-def apply_ablation(y: torch.Tensor, abl: tuple) -> torch.Tensor:
-    """
-    Directional ablation of a sublayer output written into the residual stream (see util/ablation.py):
-    y <- y * s - b * <y, a>. Exactly equivalent to merging a (row-normalized) abliteration into the
-    output projection, without touching the quantized weights. Applied in place.
-    """
-    a, b, s = abl
-    if _abl_kernel and y.dtype == torch.float and y.is_cuda and y.is_contiguous():
-        ext.ablate(y, a, b, s)
-        return y
-    yf = y if y.dtype == torch.float else y.float()
-    t = torch.matmul(yf, a.unsqueeze(-1))
-    if s is not None:
-        yf.mul_(s)
-    yf.sub_(t * b)
-    if yf is not y:
-        y.copy_(yf)
-    return y
 
 class TransformerBlock(Module):
 
@@ -76,8 +50,6 @@ class TransformerBlock(Module):
         self.layer_scalar_f = None
         self.attn_resid_scalar = None
         self.mlp_resid_scalar = None
-        self.abl_attn = None
-        self.abl_mlp = None
 
         # Hyperconnection sites (mHC): the block's residual is (bsz, seq, hc_mult, hidden)
         # fp32 streams, mixed at each sublayer site instead of the plain residual add
@@ -137,17 +109,11 @@ class TransformerBlock(Module):
                 no_defer = True,
             )
 
-        # Optional runtime ablation (abliteration sidecar next to the model, see util/ablation.py)
-        from ..util.ablation import load_block_ablation
-        self.abl_attn, self.abl_mlp = load_block_ablation(self.config, self.key, device)
-
     def unload(self):
         super().unload()
         self.layer_scalar_t = None
         self.attn_resid_scalar = None
         self.mlp_resid_scalar = None
-        self.abl_attn = None
-        self.abl_mlp = None
 
     def get_tensors(self):
         t = {}
@@ -167,13 +133,12 @@ class TransformerBlock(Module):
             (self.mlp_resid_scalar.numel() if self.mlp_resid_scalar is not None else 0)
         )
 
-    @staticmethod
-    def _had_for(module, x):
-        # Input bundle of the module's first fused matmul (see RMSNorm had_for); None when not applicable
-        if not _norm_had_enable:
-            return None
-        f = getattr(module, "input_bundle", None)
-        return f(x) if f is not None else None
+    @override
+    def prepare_for_device(self, x: torch.Tensor, params: dict) -> torch.Tensor:
+        # A deferred mHC apply_ (hyperconnections.hc_flush) lands before its streams move to another device
+        if "hc_pending" in params and x.device != self.device:
+            hc_flush(params)
+        return super().prepare_for_device(x, params)
 
     @override
     def forward(
@@ -188,51 +153,17 @@ class TransformerBlock(Module):
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
 
-        # Previous block's MLP output whose residual add is folded into this block's input norm
-        # (forward_ls sets resid_defer when the next module is a TransformerBlock)
-        pending = params.pop("resid_pending", None)
-        pending_abl = params.pop("resid_pending_abl", None)
-        fuse_in = (
-            pending is not None and self.attn is not None and not self.attn_hc and
-            isinstance(self.attn_norm, RMSNorm) and self.attn_norm.can_fuse_residual(x, pending)
-        )
-        # The previous block's MLP ablation, deferred with its output: done by the input norm when fused
-        abl_in = None
-        if pending_abl is not None:
-            if fuse_in and pending.dtype == torch.float:
-                abl_in = pending_abl
-            else:
-                apply_ablation(pending, pending_abl)
-        if pending is not None and not fuse_in:
-            x += pending
-
         if self.attn:
             if self.attn_hc:
-                hc_post, hc_comb, y = self.attn_hc.mix(x, params)
+                hc_post, hc_comb, y, normed = self.attn_hc.mix_norm(x, params, self.attn_norm)
                 y = y.half()
-                if self.attn_norm:
+                if self.attn_norm and not normed:
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
-            elif fuse_in:
-                y = self.attn_norm.forward(pending, params, out_dtype = torch.half, residual_in = x,
-                                           had_for = self._had_for(self.attn, x), abl = abl_in)
             elif self.attn_norm:
-                hf = self._had_for(self.attn, x) if isinstance(self.attn_norm, RMSNorm) else None
-                y = self.attn_norm.forward(x, params, out_dtype = torch.half, **({"had_for": hf} if hf else {}))
+                y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
             y = self.attn.forward(y, params)
-            # Ablation deferred into the MLP input norm when that norm takes the residual add
-            abl_resid = None
-            if self.abl_attn is not None:
-                if (
-                    _abl_fuse and y.dtype == torch.float and self.attn_resid_scalar is None and
-                    not self.attn_hc and not self.attn_post_norm and not self.mlp_hc and
-                    self.mlp is not None and isinstance(self.mlp_norm, RMSNorm) and
-                    self.mlp_norm.can_fuse_residual(x, y)
-                ):
-                    abl_resid = self.abl_attn
-                else:
-                    apply_ablation(y, self.abl_attn)
             if params.get("prefill") and not export_state:
                 return x
             if self.attn_resid_scalar is not None:
@@ -248,42 +179,25 @@ class TransformerBlock(Module):
 
         if self.mlp:
             if self.mlp_hc:
-                hc_post, hc_comb, y = self.mlp_hc.mix(x, params)
+                hc_post, hc_comb, y, normed = self.mlp_hc.mix_norm(x, params, self.mlp_norm)
                 y = y.half()
-                if self.mlp_norm:
+                if self.mlp_norm and not normed:
                     y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
             else:
                 params["residual"] = x
                 if y_resid is not None:
-                    y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x,
-                                              had_for = self._had_for(self.mlp, x), abl = abl_resid)
+                    y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
                 elif self.mlp_norm:
-                    hf = self._had_for(self.mlp, x) if isinstance(self.mlp_norm, RMSNorm) else None
-                    y = self.mlp_norm.forward(x, params, out_dtype = torch.half, **({"had_for": hf} if hf else {}))
+                    y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
                 else:
                     y = x.half()
             y = self.mlp.forward(y, params)
-            defer = (
-                not self.mlp_hc and not self.mlp_post_norm and self.mlp_resid_scalar is None and
-                params.get("resid_defer") and not export_state and self.layer_scalar_f is None and
-                (out_dtype or self.out_dtype) in (None, x.dtype)
-            )
-            if self.abl_mlp is not None and not (_abl_fuse and defer):
-                apply_ablation(y, self.abl_mlp)
             if self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
             if self.mlp_hc:
                 x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
-            elif (
-                params.get("resid_defer") and not export_state and self.layer_scalar_f is None and
-                (out_dtype or self.out_dtype) in (None, x.dtype)
-            ):
-                params["resid_pending"] = y
-                if self.abl_mlp is not None and _abl_fuse:
-                    params["resid_pending_abl"] = self.abl_mlp
-                return x
             else:
                 x += y
 

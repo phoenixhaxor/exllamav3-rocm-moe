@@ -65,6 +65,7 @@ enum GraphedParams
     GP_conv1d_slots,
     GP_gdn_rule_state,
     GP_gdn_rule_slots,
+    GP_gdn_rule_slots_in,
 
     GP_rope_inv_freq,
     GP_rope_position,
@@ -112,20 +113,15 @@ public:
     std::vector<std::tuple<int, int, int, int>> graph_node_sites;
 
     std::vector<cudaGraphNode_t> nodes;
-    std::vector<hipKernelNodeParams> node_params;
+    std::vector<cudaKernelNodeParams> node_params;
     // Kernel nodes captured from driver-API launches (Triton cubins) cannot be read through the
     // runtime API ("invalid device function"); their params live here instead
-    std::vector<hipKernelNodeParams> node_params_drv;
+    std::vector<CUDA_KERNEL_NODE_PARAMS> node_params_drv;
     std::vector<char> node_is_driver;
     std::vector<void*> current_values;
     std::vector<bool> node_needs_update;
 
-    // Kernel-node argument updates applied to graph_exec since it was instantiated, and the previous exec retired
-    // by the last re-instantiation with an event after its final launch (see launch())
-    int64_t updates_since_instantiate;
-    cudaGraphExec_t retired_exec;
-    cudaEvent_t retired_done;
-
+    bool capture_active;
     bool need_cublas;
     bool ready;
     bool ready_to_record;
@@ -136,6 +132,8 @@ public:
 
     cudaStream_t capture_begin();
     void capture_end();
+    // Best effort, no throwing. Call on the thread/device that began capture.
+    void capture_abort() noexcept;
 
     void record_param(void* kernel, int param_id, int param_offset, int size = 8);
     void launch(std::vector<PPTR> params, cudaStream_t stream);
@@ -143,8 +141,17 @@ public:
     void inspect_graph();
 };
 
-// EXL3_NOGRAPH=name[,name...]: modules that run their decode path eagerly instead of through a
-// captured graph ("mlp", "gdn", "attn"). A graph launch costs several us of GPU idle time on ROCm
-// on top of the per-kernel boundary, which loses to eager launches for short graphs
-bool graph_disabled_for(const char* name);
 
+// Keep capture lifetime on the same thread/device as the launch sequence.
+// All native capture callers use this scope, including failures in run_gr.
+class GraphCapture
+{
+    Graph& owner;
+    bool finished = false;
+public:
+    explicit GraphCapture(Graph& graph) : owner(graph) { owner.capture_begin(); }
+    ~GraphCapture() noexcept { if (!finished) owner.capture_abort(); }
+    GraphCapture(const GraphCapture&) = delete;
+    GraphCapture& operator=(const GraphCapture&) = delete;
+    void finish() { owner.capture_end(); finished = true; }
+};

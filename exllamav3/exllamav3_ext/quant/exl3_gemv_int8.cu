@@ -25,7 +25,13 @@ static int exl3_gemv_int8_mode()
 {
     if (_exl3_gemv_int8_mode_chk) return _exl3_gemv_int8_mode;
     const char* e = getenv("EXL3_INT8_GEMV");
+#if defined(USE_ROCM)
+    // Off by default on ROCm: the RDNA fdot2 GEMVs (rocm/quant) are faster at these shapes
+    _exl3_gemv_int8_mode = e ? atoi(e) : 0;
+#else
     _exl3_gemv_int8_mode = e ? atoi(e) : 2;
+#endif
+    _exl3_gemv_int8_mode_chk = true;
     return _exl3_gemv_int8_mode;
 }
 
@@ -166,14 +172,12 @@ static bool exl3_gemv_int8_sq
 
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
-        cudaFuncSetAttribute((const void*) fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_for(rows_max));
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem_for(rows_max));
         // Match the tensor-core kernels' shared-memory carveout: these kernels interleave with
         // them (hundreds of launches per decoded token), and a smaller carveout would make the GPU
         // drain and reconfigure the SMs on every transition - measured at ~4 us per launch in
         // graph replay
-        #ifndef __HIP_PLATFORM_AMD__
-        cudaFuncSetAttribute((const void*) fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        #endif
+        cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         gemv_attr_set[device].insert(fn);
         cuda_check(cudaPeekAtLastError());
     }
@@ -264,6 +268,16 @@ bool exl3_gemv_int8
     cudaGetDevice(&device);
     // Half-integer rates take the gate of the integer rate above them
     if (K < 1 || K + (half_k ? 1 : 0) > exl3_gemv_int8_max_k(device)) return false;
+
+    // Both int8 kernels below size their shared memory against a fixed ~80 KB budget baked into
+    // gemv_int8_sq_rows_max() and the coop path's 768-row bound, and - critically - the kernels
+    // recompute rows_per from those same constants on the device, so the host cannot simply ask
+    // for less without desyncing the two. On Turing (64 KB) the cudaFuncSetAttribute would fail
+    // and the following cuda_check would abort the process. This path is a decode-time
+    // optimization over the regular fp16 tensor-core kernel, which handles the same work, so
+    // declining is a performance loss and nothing more.
+    if (DevCtx::instance().get_smem_max(device) < 80 * 1024) return false;
+
     int num_sms = DevCtx::instance().get_num_sms(device);
     bool c_fp32 = C.dtype() == at::kFloat;
     bool residual = exl3_gemv_int8_mode() == 1;
@@ -301,14 +315,12 @@ bool exl3_gemv_int8
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
         // Upper bound over all shapes: smem_rows_max * 64 B
-        cudaFuncSetAttribute((const void*) fn, cudaFuncAttributeMaxDynamicSharedMemorySize, 768 * 16 * 4 + GEMV_STAGE_MAX_BYTES);
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, 768 * 16 * 4 + GEMV_STAGE_MAX_BYTES);
         // Match the tensor-core kernels' shared-memory carveout: these kernels interleave with
         // them (hundreds of launches per decoded token), and a smaller carveout would make the GPU
         // drain and reconfigure the SMs on every transition - measured at ~4 us per launch in
         // graph replay
-        #ifndef __HIP_PLATFORM_AMD__
-        cudaFuncSetAttribute((const void*) fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
-        #endif
+        cudaFuncSetAttribute(fn, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         gemv_attr_set[device].insert(fn);
         cuda_check(cudaPeekAtLastError());
     }

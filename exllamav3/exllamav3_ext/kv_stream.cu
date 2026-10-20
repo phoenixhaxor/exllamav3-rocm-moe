@@ -71,7 +71,7 @@ __device__ __forceinline__ int block_scan_excl(int v, int* warp_sums, int& total
     #pragma unroll
     for (int o = 1; o < 32; o <<= 1)
     {
-        int y = __shfl_up_sync(EXL3_FULL_MASK, x, o);
+        int y = __shfl_up_sync(0xffffffffu, x, o);
         if (lane >= o) x += y;
     }
     if (lane == 31) warp_sums[w] = x;
@@ -82,7 +82,7 @@ __device__ __forceinline__ int block_scan_excl(int v, int* warp_sums, int& total
         #pragma unroll
         for (int o = 1; o < 32; o <<= 1)
         {
-            int y = __shfl_up_sync(EXL3_FULL_MASK, t, o);
+            int y = __shfl_up_sync(0xffffffffu, t, o);
             if (lane >= o) t += y;
         }
         warp_sums[lane] = t;

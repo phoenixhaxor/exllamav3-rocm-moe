@@ -12,7 +12,6 @@ namespace cg = cooperative_groups;
 #include "ll.cuh"
 #include "barrier_inner.cuh"
 
-
 #define MAX_NUM_THREADS 1024
 #define BATCH_STAGE 2
 

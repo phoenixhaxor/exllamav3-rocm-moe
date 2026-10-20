@@ -1,8 +1,5 @@
 #include <Python.h>
 #include "mlp.h"
-
-void exl3_rdna3_arm_act_epilogue(int device, const void* down_suh);
-void exl3_rdna3_disarm_act_epilogue(int device);
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
@@ -40,10 +37,6 @@ void BC_GatedMLP::run_bszN_gr
 
     if (gu_ptrs_trellis)
     {
-        // RDNA3: the gate/up matmul also writes the down projection's input transform of silu(g) * u
-        // (consumed by exl3_gemm_silu_gr below, which then skips its input kernel)
-        const bool act_epi = !graph && act_silu && act_limit == 0.0f && fuse_act_down;
-        if (act_epi) exl3_rdna3_arm_act_epilogue(x.device().index(), down->suh.data_ptr());
         exl3_mgemm_gr
         (
             x,
@@ -65,7 +58,6 @@ void BC_GatedMLP::run_bszN_gr
             1   // mgemm's reduction-group param, unused here (no weights -> no reduction runs);
                 // bszm=2 is the gate/up slot pair, unrelated to num_tokens (carried via size_m)
         );
-        if (act_epi) exl3_rdna3_disarm_act_epilogue(x.device().index());
     }
     else
     {
@@ -86,20 +78,14 @@ void BC_GatedMLP::run_bszN_gr
     at::Tensor g = gu_n.select(0, 0).unsqueeze(0);
     at::Tensor u = gu_n.select(0, 1).unsqueeze(0);
 
-    // RDNA3: silu(g) * u folded into the down projection's input transform (one kernel less)
-    bool fused_act = act_silu && act_limit == 0.0f && fuse_act_down &&
-        exl3_gemm_silu_gr(g, u, down->trellis, d, down->suh, down->svh, down->mcg, down->mul1, graph);
-
-    if (fused_act) {}
-    else if (act_silu)
+    if (act_silu)
         silu_mul_gr(g, u, a_n, act_limit, graph);
     else if (act_gelu)
         gelu_mul_gr(g, u, a_n, act_limit, graph);
     else if (act_relu2)
         relu2_mul_gr(g, u, a_n, act_limit, graph);
 
-    if (!fused_act)
-        exl3_gemm_gr(a_n, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph);
+    exl3_gemm_gr(a_n, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph);
     if (down->bias)
         add_gr(d, down->bias.value(), d, graph);
 }
@@ -119,8 +105,7 @@ void BC_GatedMLP::run_bszN
 
     Graph& g = graph_bszN[graphidx];
 
-    static const bool nograph = graph_disabled_for("mlp");
-    if (nograph || g.disabled || (!g.ready && !g.ready_to_record))
+    if (g.disabled || (!g.ready && !g.ready_to_record))
     {
         run_bszN_gr(x, d, num_tokens, nullptr);
         g.ready_to_record = true;
@@ -129,9 +114,9 @@ void BC_GatedMLP::run_bszN
     {
         if (!g.ready)
         {
-            g.capture_begin();
+            GraphCapture capture(g);
             run_bszN_gr(x, d, num_tokens, &g);
-            g.capture_end();
+            capture.finish();
         }
 
         std::vector<PPTR> args;
@@ -218,9 +203,9 @@ void BC_MLP::run_bsz1
     {
         if (!graph_bsz1.ready)
         {
-            graph_bsz1.capture_begin();
+            GraphCapture capture(graph_bsz1);
             run_bsz1_gr(x, d, &graph_bsz1);
-            graph_bsz1.capture_end();
+            capture.finish();
         }
 
         std::vector<PPTR> args;
