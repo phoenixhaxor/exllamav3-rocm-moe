@@ -23,6 +23,10 @@ _mtp_coupled = os.environ.get("EXL3_MTP_COUPLED", "1") != "0"
 # ends the process (a supervisor restarts it). A hung GPU <-> CPU-expert handoff otherwise leaves the server spinning
 # in a device synchronize forever while its health endpoint still reports healthy. 0 disables
 _watchdog_s = float(os.environ.get("EXL3_WATCHDOG_S", 300))
+# Heartbeat: while jobs exist, one line to stderr every this many seconds with the iteration count, how long the
+# current iteration has run and each job's progress (prompt position / tokens generated), so a stall that never trips
+# the watchdog (iterations completing without any job finishing) still leaves a trace. 0 disables
+_heartbeat_s = float(os.environ.get("EXL3_HEARTBEAT_S", 60))
 from .adaptive_window import AdaptiveWindow
 _draft_nb_enable = os.environ.get("EXL3_DRAFT_NB", "1") != "0"
 # Decode time granted to decoding jobs after each prefill round that ran beside them, as a fraction of that round's
@@ -185,7 +189,9 @@ class Generator:
         """
         large_allocs_mmap()
         self._iter_t0 = None
-        if _watchdog_s > 0:
+        self._iter_n = 0
+        self._iter_end = None
+        if _watchdog_s > 0 or _heartbeat_s > 0:
             import threading
             threading.Thread(target = self._watchdog, name = "exl3-watchdog", daemon = True).start()
 
@@ -531,6 +537,7 @@ class Generator:
     @torch.inference_mode
     def iterate(self) -> list[dict]:
         self._iter_t0 = time.time()
+        self._iter_n += 1
         # Backstop for the watchdog thread: a hung GPU stream can block the generator thread inside a call that
         # holds the GIL (a pageable host-to-device copy), and then the Python thread never runs; one hang was
         # noticed 1178 s in instead of 300. faulthandler's timer is a C thread: 30 s after the Python watchdog
@@ -541,6 +548,7 @@ class Generator:
             return self._iterate()
         finally:
             self._iter_t0 = None
+            self._iter_end = time.time()
             if _watchdog_s > 0:
                 faulthandler.cancel_dump_traceback_later()
 
@@ -723,15 +731,47 @@ class Generator:
 
     def _watchdog(self):
         import faulthandler, sys, time as _time
+        period = min(x for x in (30.0, _watchdog_s / 4 if _watchdog_s > 0 else 30.0, _heartbeat_s or 30.0) if x > 0)
+        last_hb = _time.time()
+        hb_iter = 0
         while True:
-            _time.sleep(min(30.0, _watchdog_s / 4))
+            _time.sleep(period)
+            now = _time.time()
             t0 = self._iter_t0
-            if t0 is not None and _time.time() - t0 > _watchdog_s:
-                print(f" !! exllamav3 watchdog: one generator iteration has run for {_time.time() - t0:.0f} s "
+            if _watchdog_s > 0 and t0 is not None and now - t0 > _watchdog_s:
+                print(f" !! exllamav3 watchdog: one generator iteration has run for {now - t0:.0f} s "
                       f"(EXL3_WATCHDOG_S={_watchdog_s:.0f}); dumping stacks and exiting", file = sys.stderr, flush = True)
                 faulthandler.dump_traceback(file = sys.stderr, all_threads = True)
                 sys.stderr.flush()
                 os._exit(70)
+            if _heartbeat_s > 0 and now - last_hb >= _heartbeat_s:
+                try:
+                    self._heartbeat(now, t0, now - last_hb, self._iter_n - hb_iter, sys.stderr)
+                except Exception as e:
+                    print(f" -- heartbeat failed: {e!r}", file = sys.stderr, flush = True)
+                last_hb = now
+                hb_iter = self._iter_n
+
+
+    def _heartbeat(self, now, t0, span, iters, out):
+        active = list(self.active_jobs)
+        pending = list(self.pending_jobs)
+        if not active and not pending:
+            return
+        jobs = []
+        for job in active:
+            seq = job.sequences[0] if job.sequences else None
+            tag = f"#{job.serial_number}"
+            if job.identifier is not None:
+                tag += f"/{job.identifier}"
+            if seq is not None and not job.is_prefill_done():
+                jobs.append(f"{tag} prefill {seq.kv_position}/{len(seq.sequence_ids) - 1}")
+            else:
+                jobs.append(f"{tag} gen {job.new_tokens}")
+        running = f"current {now - t0:.0f} s" if t0 is not None else \
+            (f"idle {now - self._iter_end:.0f} s" if self._iter_end is not None else "idle")
+        print(f" -- heartbeat: {iters} iterations in {span:.0f} s ({running}), active {len(active)}, "
+              f"pending {len(pending)}: " + ", ".join(jobs), file = out, flush = True)
 
 
     @torch.inference_mode()
